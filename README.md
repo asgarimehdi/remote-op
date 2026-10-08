@@ -6,8 +6,10 @@ Minimal Tkinter desktop app to manage GitHub Actions workflows and watch
 ## Features
 
 - **Settings** — repo, password, branch. Saved to `settings.json` on Save.
-  Save also sets `$env:OPENCODE_PASSWORD` for the app session and persists
-  it with `setx` so new terminals have it.
+  Save also sets `$env:OPENCODE_SERVER_PASSWORD` (the variable the
+  OpenCode V2 client reads; `$env:OPENCODE_PASSWORD` is set alongside it
+  for legacy tooling) for the app session and persists both with `setx`
+  so new terminals have them.
 - **Workflows** — loaded from the remote repo (`gh workflow list`).
   Run one or all (`gh workflow run <name> --repo <repo> --ref <branch>`).
   A workflow that already has an active run on the branch is skipped, and
@@ -18,7 +20,11 @@ Minimal Tkinter desktop app to manage GitHub Actions workflows and watch
   it via the API as `<prefix><N>.yml`. Gaps are filled first (with
   open1/open2/open4 present, Add creates open3). The new instance starts
   with a clean state and creates `opencode/instances/<prefix><N>/` on
-  its first sync.
+  its first sync. When no instance is left at all, Add recovers the most
+  recently deleted workflow from git history as its template, so the
+  fleet can always be rebuilt from inside the app. Add / Delete /
+  Rename run one at a time (a click while one is running is logged and
+  ignored) — parallel deletes used to race each other's commits.
 - **Delete selected** — deletes an instance completely: its workflow
   file plus ALL of its data under `opencode/instances/openN/` (one
   commit). The shared `opencode/config` is never touched. If the
