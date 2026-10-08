@@ -113,7 +113,12 @@ class App(tk.Tk):
         self.log_q = queue.Queue()
         self.up_since = {}  # url -> timestamp when first seen UP
         self._triggering = False  # only one workflow trigger batch at a time
+        self._inst_busy = False  # only one add/delete/rename at a time
+        # OpenCode V2's client reads the server password from
+        # OPENCODE_SERVER_PASSWORD (the V1-era OPENCODE_PASSWORD is kept
+        # alongside it for any older tooling that still looks for it).
         os.environ["OPENCODE_PASSWORD"] = self.settings.get("password", "")
+        os.environ["OPENCODE_SERVER_PASSWORD"] = self.settings.get("password", "")
         self._build()
         self.after(100, self._drain_log)
         # initial load + start 5-min uptime loop
@@ -202,19 +207,23 @@ class App(tk.Tk):
                          "password": self.pass_var.get(),
                          "branch": self.branch_var.get().strip() or "opc"}
         save_settings(self.settings)
-        # set $env:OPENCODE_PASSWORD for this process + persist for future cmd/PowerShell
+        # set $env:OPENCODE_SERVER_PASSWORD (what the OpenCode V2 client
+        # reads) + $env:OPENCODE_PASSWORD (legacy) for this process, and
+        # persist both for future cmd/PowerShell sessions
         os.environ["OPENCODE_PASSWORD"] = self.settings["password"]
-        self.log(f"$env:OPENCODE_PASSWORD set ({len(self.settings['password'])} chars)")
+        os.environ["OPENCODE_SERVER_PASSWORD"] = self.settings["password"]
+        self.log(f"$env:OPENCODE_SERVER_PASSWORD set ({len(self.settings['password'])} chars)")
         self.log(f"Saved: {self.settings['repo']} / branch={self.settings['branch']}")
         if os.name == "nt":
             try:
                 si = subprocess.STARTUPINFO()
                 si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                subprocess.run(["setx", "OPENCODE_PASSWORD", self.settings["password"]],
-                               capture_output=True, text=True, timeout=15,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
-                               startupinfo=si)
-                self.log("Persisted via setx — new terminals will have OPENCODE_PASSWORD.")
+                for var in ("OPENCODE_SERVER_PASSWORD", "OPENCODE_PASSWORD"):
+                    subprocess.run(["setx", var, self.settings["password"]],
+                                   capture_output=True, text=True, timeout=15,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+                                   startupinfo=si)
+                self.log("Persisted via setx — new terminals will have OPENCODE_SERVER_PASSWORD.")
             except Exception as e:
                 self.log(f"setx failed (session-only): {e}")
 
@@ -386,8 +395,9 @@ class App(tk.Tk):
     def connect_server(self, url):
         """Open a visible terminal and run opencode --server <url> with password set."""
         pwd = self.pass_var.get().replace("'", "''")
-        ps_cmd = f"$env:OPENCODE_PASSWORD='{pwd}'; opencode --server {url}"
-        self.log(ps_cmd)
+        ps_cmd = (f"$env:OPENCODE_SERVER_PASSWORD='{pwd}'; "
+                  f"$env:OPENCODE_PASSWORD='{pwd}'; opencode --server {url}")
+        self.log(f"opencode --server {url} (password via $env:OPENCODE_SERVER_PASSWORD)")
         try:
             if os.name == "nt":
                 subprocess.Popen(
@@ -396,7 +406,9 @@ class App(tk.Tk):
                 )
             else:
                 subprocess.Popen(["opencode", "--server", url],
-                                 env={**os.environ, "OPENCODE_PASSWORD": self.pass_var.get()})
+                                 env={**os.environ,
+                                      "OPENCODE_PASSWORD": self.pass_var.get(),
+                                      "OPENCODE_SERVER_PASSWORD": self.pass_var.get()})
         except FileNotFoundError:
             self.log("ERROR: powershell/opencode not found in PATH.")
         except Exception as e:
@@ -494,6 +506,40 @@ class App(tk.Tk):
                 result[name] = fname
         return result
 
+    def _history_template(self, repo, branch):
+        """When no workflow files are left, recover the most recent
+        instance workflow from git history: returns (instance_name,
+        file_text) of the newest deleted workflow that still parses,
+        or None."""
+        commits = self._api_json(
+            "GET", f"repos/{repo}/commits?sha={branch}&path=.github/workflows&per_page=30")
+        if not isinstance(commits, list):
+            return None
+        for c in commits:
+            sha = c.get("sha")
+            if not sha:
+                continue
+            listing = self._api_json(
+                "GET", f"repos/{repo}/contents/.github/workflows?ref={sha}")
+            if not isinstance(listing, list):
+                continue
+            for e in listing:
+                fname = e.get("name", "")
+                if not fname.endswith(".yml"):
+                    continue
+                tpl = self._api_json(
+                    "GET", f"repos/{repo}/contents/.github/workflows/{fname}?ref={sha}")
+                if not tpl or "content" not in tpl:
+                    continue
+                try:
+                    text = base64.b64decode(tpl["content"]).decode("utf-8")
+                except Exception:
+                    continue
+                name = workflow_instance(text)
+                if name and parse_instance_name(name):
+                    return name, text
+        return None
+
     def _cancel_and_wait(self, name, timeout_s=180):
         """Cancel the workflow's active runs and wait until none are
         active — a dying run's final sync writes state back, so file /
@@ -548,7 +594,17 @@ class App(tk.Tk):
                        command=lambda u=url: self.connect_server(u)).pack(side="right", padx=2)
 
     def add_instance(self):
-        self.run_bg(self._add_instance)
+        if self._inst_busy:
+            self.log("Another instance operation is running — wait for it to finish.")
+            return
+        self._inst_busy = True
+        self.run_bg(self._add_instance_locked)
+
+    def _add_instance_locked(self):
+        try:
+            self._add_instance()
+        finally:
+            self._inst_busy = False
 
     def _add_instance(self):
         repo = self.repo_var.get().strip()
@@ -557,9 +613,6 @@ class App(tk.Tk):
             self.log("Add instance: set the repo in Settings first.")
             return
         inst = self._instance_files(repo, branch)
-        if not inst:
-            self.log("Add instance: no instance workflow (with a WF_NAME) found in the repo.")
-            return
         used = {parse_instance_name(n)[1] for n in inst}
         # A number whose state dir survived a hand-deleted workflow must
         # not be reused either — its old data would silently revive.
@@ -570,21 +623,39 @@ class App(tk.Tk):
                 if p:
                     used.add(p[1])
         new_num = next_free_number(used)
-        template_name, template_file = sorted(
-            inst.items(), key=lambda kv: parse_instance_name(kv[0])[1])[0]
-        prefix = parse_instance_name(template_name)[0]
+        if inst:
+            template_name, template_file = sorted(
+                inst.items(), key=lambda kv: parse_instance_name(kv[0])[1])[0]
+            prefix = parse_instance_name(template_name)[0]
+            tpl = self._api_json("GET", f"repos/{repo}/contents/.github/workflows/{template_file}?ref={branch}")
+            if not tpl or "content" not in tpl:
+                self.log(f"Add instance: could not read template {template_file}.")
+                return
+            try:
+                template_text = base64.b64decode(tpl["content"]).decode("utf-8")
+            except Exception:
+                self.log(f"Add instance: could not decode template {template_file}.")
+                return
+        else:
+            # Zero instances left: recover the most recently deleted
+            # workflow from git history and use it as the template, so
+            # the fleet can always be rebuilt from inside the app.
+            hist = self._history_template(repo, branch)
+            if not hist:
+                self.log("Add instance: no instance workflow found, and none in git history either.")
+                return
+            prefix = parse_instance_name(hist[0])[0]
+            template_text = hist[1]
+            self.log(f"Add instance: repo is empty — using the last deleted workflow "
+                     f"({hist[0]}) from git history as the template.")
         new_name = f"{prefix}{new_num}"
-        tpl = self._api_json("GET", f"repos/{repo}/contents/.github/workflows/{template_file}?ref={branch}")
-        if not tpl or "content" not in tpl:
-            self.log(f"Add instance: could not read template {template_file}.")
-            return
         try:
-            new_text = renamed_workflow(base64.b64decode(tpl["content"]).decode("utf-8"), new_name)
+            new_text = renamed_workflow(template_text, new_name)
         except ValueError as e:
             self.log(f"Add instance: {e}")
             return
         new_file = f"{new_name}.yml"
-        body = {"message": f"Add {new_name} workflow (copied from {template_file})",
+        body = {"message": f"Add {new_name} workflow",
                 "content": base64.b64encode(new_text.encode("utf-8")).decode(),
                 "branch": branch}
         rc, _ = self._gh_api("PUT", f"repos/{repo}/contents/.github/workflows/{new_file}", body)
@@ -596,6 +667,9 @@ class App(tk.Tk):
         self.after(3000, self.reload_workflows)
 
     def delete_instance(self):
+        if self._inst_busy:
+            self.log("Another instance operation is running — wait for it to finish.")
+            return
         names = self._wf_names(True)
         if not names:
             return
@@ -613,7 +687,14 @@ class App(tk.Tk):
                 f"The shared opencode/config (skills etc.) is NOT touched.\n"
                 f"If {name} has an active run, it will be cancelled first."):
             return
-        self.run_bg(self._delete_instance, name)
+        self._inst_busy = True
+        self.run_bg(self._delete_instance_locked, name)
+
+    def _delete_instance_locked(self, name):
+        try:
+            self._delete_instance(name)
+        finally:
+            self._inst_busy = False
 
     def _delete_instance(self, name):
         repo = self.repo_var.get().strip()
@@ -645,7 +726,7 @@ class App(tk.Tk):
             self.log(f"Delete: no workflow file found for {name} (already gone?) — continuing with the data.")
         # 3. Delete opencode/instances/<name>/ in one git-tree commit.
         prefix = f"opencode/instances/{name}/"
-        for attempt in range(3):
+        for attempt in range(5):
             ref = self._api_json("GET", f"repos/{repo}/git/ref/heads/{branch}")
             head = (ref or {}).get("object", {}).get("sha")
             if not head:
@@ -676,7 +757,8 @@ class App(tk.Tk):
             if rc == 0:
                 self.log(f"✅ Deleted {len(paths)} files under {prefix}")
                 break
-            self.log(f"Delete: branch moved during delete (attempt {attempt + 1}/3) — retrying…")
+            self.log(f"Delete: branch moved during delete (attempt {attempt + 1}/5) — retrying…")
+            time.sleep(2)
         else:
             self.log("Delete: data delete did not land — run Delete again.")
             return
@@ -685,6 +767,9 @@ class App(tk.Tk):
         self.after(0, self.refresh_runs)
 
     def rename_prefix(self):
+        if self._inst_busy:
+            self.log("Another instance operation is running — wait for it to finish.")
+            return
         names = [self.wf_tree.item(i, "values")[0] for i in self.wf_tree.get_children()]
         prefixes = {p[0] for p in (parse_instance_name(n) for n in names) if p}
         if not prefixes:
@@ -718,7 +803,14 @@ class App(tk.Tk):
                 f"Tailscale device entries (they expire on their own).\n"
                 f"Active runs will be cancelled first."):
             return
-        self.run_bg(self._rename_prefix, current, new)
+        self._inst_busy = True
+        self.run_bg(self._rename_prefix_locked, current, new)
+
+    def _rename_prefix_locked(self, old_prefix, new_prefix):
+        try:
+            self._rename_prefix(old_prefix, new_prefix)
+        finally:
+            self._inst_busy = False
 
     def _rename_prefix(self, old_prefix, new_prefix):
         repo = self.repo_var.get().strip()
@@ -780,7 +872,7 @@ class App(tk.Tk):
         # 3. Move the state dirs in one git-tree commit.
         moves = [(f"opencode/instances/{o}/", f"opencode/instances/{n}/")
                  for o, n in sorted(targets.items())]
-        for attempt in range(3):
+        for attempt in range(5):
             ref = self._api_json("GET", f"repos/{repo}/git/ref/heads/{branch}")
             head = (ref or {}).get("object", {}).get("sha")
             if not head:
@@ -819,7 +911,8 @@ class App(tk.Tk):
             if rc == 0:
                 self.log(f"✅ Moved state for {len(targets)} instance(s) into opencode/instances/{new_prefix}N/")
                 break
-            self.log(f"Rename: branch moved during the state move (attempt {attempt + 1}/3) — retrying…")
+            self.log(f"Rename: branch moved during the state move (attempt {attempt + 1}/5) — retrying…")
+            time.sleep(2)
         else:
             self.log("Rename: the state move did not land — run Rename again to finish it.")
             return
