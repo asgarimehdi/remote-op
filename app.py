@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext, simpledialog
 import urllib.request
 import webbrowser
 
@@ -19,8 +19,24 @@ else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
 
-INSTANCE_RE = re.compile(r"^open(\d+)$")
-WORKFLOW_FILE_RE = re.compile(r"^op(\d+)\.yml$")
+NAME_RE = re.compile(r"^(.*?)(\d+)$")
+PREFIX_RE = re.compile(r"^[a-z]([a-z0-9-]*[a-z])?$")
+
+
+def parse_instance_name(name):
+    """'open3' -> ('open', 3); 'mehdi12' -> ('mehdi', 12); else None.
+
+    A valid prefix starts and ends with a letter, so the trailing
+    digits are unambiguously the instance number.
+    """
+    m = NAME_RE.match(name or "")
+    if not m or not PREFIX_RE.match(m.group(1)):
+        return None
+    return m.group(1), int(m.group(2))
+
+
+def valid_prefix(prefix):
+    return bool(PREFIX_RE.match(prefix or ""))
 
 
 def next_free_number(used):
@@ -32,25 +48,38 @@ def next_free_number(used):
 
 
 def server_urls(names):
-    """Uptime URLs derived from workflow names: openN -> http://openN:4096."""
-    nums = sorted(int(m.group(1)) for name in names
-                  for m in [INSTANCE_RE.match(name or "")] if m)
-    return [f"http://open{n}:4096" for n in nums]
+    """Uptime URLs derived from workflow names: <prefix>N -> http://<prefix>N:4096."""
+    parsed = [p for p in (parse_instance_name(n) for n in names) if p]
+    parsed.sort(key=lambda pn: (pn[0], pn[1]))
+    return [f"http://{p}{n}:4096" for p, n in parsed]
+
+
+def workflow_instance(text):
+    """The WF_NAME value inside a workflow file's text, or None."""
+    m = re.search(r"WF_NAME:\s*(\S+)", text)
+    return m.group(1) if m else None
 
 
 def renamed_workflow(text, new_name):
-    """An existing workflow file re-pointed at `new_name` (openN).
+    """An existing workflow file re-pointed at `new_name`.
 
-    Only three spots carry the instance identity: the workflow `name:`,
-    the WF_NAME job env, and the sync-back commit message. Raises
-    ValueError if any marker is missing.
+    The old instance name is read from the file's own WF_NAME, so any
+    prefix works. Only three spots carry the identity: the workflow
+    `name:`, the WF_NAME job env, and the sync-back commit message.
+    Raises ValueError if a marker is missing.
     """
-    out, n1 = re.subn(r"(?m)^name:\s*open\d+\s*$", f"name: {new_name}", text, count=1)
-    out, n2 = re.subn(r"WF_NAME:\s*open\d+", f"WF_NAME: {new_name}", out, count=1)
-    out, n3 = re.subn(r"from open\d+ instance", f"from {new_name} instance", out, count=1)
+    old_name = workflow_instance(text)
+    if not old_name:
+        raise ValueError("template has no WF_NAME")
+    old = re.escape(old_name)
+    out, n1 = re.subn(rf"(?m)^name:\s*{old}\s*$", f"name: {new_name}", text, count=1)
+    out, n2 = re.subn(rf"WF_NAME:\s*{old}", f"WF_NAME: {new_name}", out, count=1)
+    out, n3 = re.subn(rf"from {old} instance", f"from {new_name} instance", out, count=1)
     if not (n1 and n2 and n3):
         raise ValueError("template is missing name:/WF_NAME:/commit-message markers")
     return out
+
+
 DEFAULTS = {"repo": "", "password": "", "branch": ""}
 
 
@@ -120,6 +149,7 @@ class App(tk.Tk):
         ttk.Button(wb, text="Run ALL", command=self.run_all).pack(side="left", padx=2)
         ttk.Button(wb, text="Add instance", command=self.add_instance).pack(side="left", padx=2)
         ttk.Button(wb, text="Delete selected", command=self.delete_instance).pack(side="left", padx=2)
+        ttk.Button(wb, text="Rename prefix…", command=self.rename_prefix).pack(side="left", padx=2)
         self.wf_tree = ttk.Treeview(w, columns=("name", "state"), show="headings", height=6)
         self.wf_tree.heading("name", text="workflow")
         self.wf_tree.heading("state", text="state")
@@ -439,6 +469,60 @@ class App(tk.Tk):
         self._refresh_runs_sync()
 
     # ----- instances: add / delete -----
+    def _instance_files(self, repo, branch):
+        """{instance_name: workflow_filename} for every workflow file in
+        the repo whose WF_NAME is an instance name (<prefix><number>).
+        The WF_NAME inside the file is authoritative — file names have
+        varied over time (op1.yml hosts open1)."""
+        listing = self._api_json("GET", f"repos/{repo}/contents/.github/workflows?ref={branch}")
+        result = {}
+        if not isinstance(listing, list):
+            return result
+        for e in listing:
+            fname = e.get("name", "")
+            if not fname.endswith(".yml"):
+                continue
+            tpl = self._api_json("GET", f"repos/{repo}/contents/.github/workflows/{fname}?ref={branch}")
+            if not tpl or "content" not in tpl:
+                continue
+            try:
+                text = base64.b64decode(tpl["content"]).decode("utf-8")
+            except Exception:
+                continue
+            name = workflow_instance(text)
+            if name and parse_instance_name(name):
+                result[name] = fname
+        return result
+
+    def _cancel_and_wait(self, name, timeout_s=180):
+        """Cancel the workflow's active runs and wait until none are
+        active — a dying run's final sync writes state back, so file /
+        data operations must not race it. Returns True when clear."""
+        if name not in self._active_workflows():
+            return True
+        self.log(f"{name} has an active run — cancelling it first…")
+        branch = self.branch_var.get().strip() or "opc"
+        rc, out = self._gh(["run", "list", "--limit", "50", "--json",
+                            "databaseId,workflowName,status,headBranch"])
+        ids = []
+        if rc == 0:
+            try:
+                ids = [str(r["databaseId"]) for r in json.loads(out or "[]")
+                       if r.get("workflowName") == name
+                       and r.get("status") in self.ACTIVE_STATUSES
+                       and r.get("headBranch") == branch]
+            except Exception:
+                ids = []
+        for rid in ids:
+            self._gh(["run", "cancel", rid])
+        waited = 0
+        while waited < timeout_s:
+            time.sleep(5)
+            waited += 5
+            if name not in self._active_workflows():
+                return True
+        return name not in self._active_workflows()
+
     def _rebuild_servers(self, names):
         """Rebuild the uptime rows from the loaded workflow names, so a
         newly added instance appears (and a deleted one disappears)."""
@@ -472,38 +556,42 @@ class App(tk.Tk):
         if not repo:
             self.log("Add instance: set the repo in Settings first.")
             return
-        listing = self._api_json("GET", f"repos/{repo}/contents/.github/workflows?ref={branch}")
-        if not isinstance(listing, list):
-            self.log("Add instance: could not list .github/workflows.")
+        inst = self._instance_files(repo, branch)
+        if not inst:
+            self.log("Add instance: no instance workflow (with a WF_NAME) found in the repo.")
             return
-        files = {}
-        for e in listing:
-            m = WORKFLOW_FILE_RE.match(e.get("name", ""))
-            if m:
-                files[int(m.group(1))] = e["name"]
-        if not files:
-            self.log("Add instance: no opN.yml template found in the repo.")
-            return
-        new_num = next_free_number(set(files))
-        new_name = f"open{new_num}"
-        template_name = files[min(files)]
-        tpl = self._api_json("GET", f"repos/{repo}/contents/.github/workflows/{template_name}?ref={branch}")
+        used = {parse_instance_name(n)[1] for n in inst}
+        # A number whose state dir survived a hand-deleted workflow must
+        # not be reused either — its old data would silently revive.
+        listing = self._api_json("GET", f"repos/{repo}/contents/opencode/instances?ref={branch}")
+        if isinstance(listing, list):
+            for e in listing:
+                p = parse_instance_name(e.get("name", ""))
+                if p:
+                    used.add(p[1])
+        new_num = next_free_number(used)
+        template_name, template_file = sorted(
+            inst.items(), key=lambda kv: parse_instance_name(kv[0])[1])[0]
+        prefix = parse_instance_name(template_name)[0]
+        new_name = f"{prefix}{new_num}"
+        tpl = self._api_json("GET", f"repos/{repo}/contents/.github/workflows/{template_file}?ref={branch}")
         if not tpl or "content" not in tpl:
-            self.log(f"Add instance: could not read template {template_name}.")
+            self.log(f"Add instance: could not read template {template_file}.")
             return
         try:
             new_text = renamed_workflow(base64.b64decode(tpl["content"]).decode("utf-8"), new_name)
         except ValueError as e:
             self.log(f"Add instance: {e}")
             return
-        body = {"message": f"Add {new_name} workflow (copied from {template_name})",
+        new_file = f"{new_name}.yml"
+        body = {"message": f"Add {new_name} workflow (copied from {template_file})",
                 "content": base64.b64encode(new_text.encode("utf-8")).decode(),
                 "branch": branch}
-        rc, _ = self._gh_api("PUT", f"repos/{repo}/contents/.github/workflows/op{new_num}.yml", body)
+        rc, _ = self._gh_api("PUT", f"repos/{repo}/contents/.github/workflows/{new_file}", body)
         if rc != 0:
-            self.log(f"Add instance: creating op{new_num}.yml failed.")
+            self.log(f"Add instance: creating {new_file} failed.")
             return
-        self.log(f"✅ Created .github/workflows/op{new_num}.yml — {new_name} starts with a "
+        self.log(f"✅ Created .github/workflows/{new_file} — {new_name} starts with a "
                  f"clean state and creates opencode/instances/{new_name}/ on its first sync.")
         self.after(3000, self.reload_workflows)
 
@@ -512,15 +600,14 @@ class App(tk.Tk):
         if not names:
             return
         name = names[0]
-        m = INSTANCE_RE.match(name)
-        if not m:
-            messagebox.showwarning("Delete instance", f"{name} is not an openN instance.")
+        if not parse_instance_name(name):
+            messagebox.showwarning("Delete instance",
+                                   f"{name} is not an instance name (<prefix><number>).")
             return
-        fname = f"op{m.group(1)}.yml"
         if not messagebox.askyesno(
                 "Delete instance",
                 f"Delete {name} completely?\n\n"
-                f"• workflow file .github/workflows/{fname}\n"
+                f"• its workflow file in .github/workflows/\n"
                 f"• ALL its data under opencode/instances/{name}/ "
                 f"(sessions, caches, 9router db)\n\n"
                 f"The shared opencode/config (skills etc.) is NOT touched.\n"
@@ -534,43 +621,28 @@ class App(tk.Tk):
         if not repo:
             self.log("Delete instance: set the repo in Settings first.")
             return
-        num = INSTANCE_RE.match(name).group(1)
         # 1. Stop an active run first: its final sync-back would
         #    resurrect the data deleted below.
-        if name in self._active_workflows():
-            self.log(f"{name} has an active run — cancelling it before delete…")
-            rc, out = self._gh(["run", "list", "--limit", "50", "--json",
-                                "databaseId,workflowName,status,headBranch"])
-            ids = []
-            if rc == 0:
-                try:
-                    ids = [str(r["databaseId"]) for r in json.loads(out or "[]")
-                           if r.get("workflowName") == name
-                           and r.get("status") in self.ACTIVE_STATUSES
-                           and r.get("headBranch") == branch]
-                except Exception:
-                    ids = []
-            for rid in ids:
-                self._gh(["run", "cancel", rid])
-            for _ in range(36):  # up to ~3 min for the final sync to finish
-                time.sleep(5)
-                if name not in self._active_workflows():
-                    break
-            if name in self._active_workflows():
-                self.log(f"Delete aborted: {name} is still running.")
+        if not self._cancel_and_wait(name):
+            self.log(f"Delete aborted: {name} is still running.")
+            return
+        # 2. Delete the workflow file (looked up by its WF_NAME).
+        fname = self._instance_files(repo, branch).get(name)
+        if fname:
+            meta = self._api_json("GET", f"repos/{repo}/contents/.github/workflows/{fname}?ref={branch}")
+            if meta and meta.get("sha"):
+                rc, _ = self._gh_api("DELETE", f"repos/{repo}/contents/.github/workflows/{fname}",
+                                     {"message": f"Remove {name} workflow",
+                                      "sha": meta["sha"], "branch": branch})
+                if rc != 0:
+                    self.log(f"Delete: removing {fname} failed — aborting before the data delete.")
+                    return
+                self.log(f"✅ Deleted .github/workflows/{fname}")
+            else:
+                self.log(f"Delete: could not read {fname} — aborting before the data delete.")
                 return
-        # 2. Delete the workflow file.
-        meta = self._api_json("GET", f"repos/{repo}/contents/.github/workflows/op{num}.yml?ref={branch}")
-        if meta and meta.get("sha"):
-            rc, _ = self._gh_api("DELETE", f"repos/{repo}/contents/.github/workflows/op{num}.yml",
-                                 {"message": f"Remove {name} workflow",
-                                  "sha": meta["sha"], "branch": branch})
-            if rc != 0:
-                self.log(f"Delete: removing op{num}.yml failed — aborting before the data delete.")
-                return
-            self.log(f"✅ Deleted .github/workflows/op{num}.yml")
         else:
-            self.log(f"Delete: op{num}.yml not found (already gone?) — continuing with the data.")
+            self.log(f"Delete: no workflow file found for {name} (already gone?) — continuing with the data.")
         # 3. Delete opencode/instances/<name>/ in one git-tree commit.
         prefix = f"opencode/instances/{name}/"
         for attempt in range(3):
@@ -609,6 +681,149 @@ class App(tk.Tk):
             self.log("Delete: data delete did not land — run Delete again.")
             return
         self.log(f"✅ {name} deleted. Shared opencode/config untouched.")
+        self.after(0, self.reload_workflows)
+        self.after(0, self.refresh_runs)
+
+    def rename_prefix(self):
+        names = [self.wf_tree.item(i, "values")[0] for i in self.wf_tree.get_children()]
+        prefixes = {p[0] for p in (parse_instance_name(n) for n in names) if p}
+        if not prefixes:
+            messagebox.showwarning("Rename prefix", "No instances loaded — press Reload first.")
+            return
+        current = sorted(prefixes)[0]
+        new = simpledialog.askstring(
+            "Rename prefix",
+            f"Current prefix: {current}\nNew prefix:",
+            parent=self)
+        if new is None:
+            return
+        new = new.strip().lower()
+        if not valid_prefix(new):
+            messagebox.showerror(
+                "Rename prefix",
+                f"'{new}' is not a valid prefix.\nUse lowercase letters/digits/hyphens, "
+                "starting and ending with a letter (e.g. mehdi, fork).")
+            return
+        if new == current:
+            messagebox.showinfo("Rename prefix", "That is already the current prefix.")
+            return
+        if not messagebox.askyesno(
+                "Rename prefix",
+                f"Rename prefix '{current}' → '{new}' in this repo?\n\n"
+                f"• workflow files, names and WF_NAME ({current}1 → {new}1, …)\n"
+                f"• instance data moves: opencode/instances/{current}N/ → {new}N/\n"
+                f"• machines come up as {new}1, {new}2, … on Tailscale\n\n"
+                f"NOT renamed: the h-dashboard branches (new ones are created on the "
+                f"next runs; the old {current}N branches stay as leftovers) and old "
+                f"Tailscale device entries (they expire on their own).\n"
+                f"Active runs will be cancelled first."):
+            return
+        self.run_bg(self._rename_prefix, current, new)
+
+    def _rename_prefix(self, old_prefix, new_prefix):
+        repo = self.repo_var.get().strip()
+        branch = self.branch_var.get().strip() or "opc"
+        if not repo:
+            self.log("Rename prefix: set the repo in Settings first.")
+            return
+        inst = self._instance_files(repo, branch)
+        targets = {}
+        for name in inst:
+            p = parse_instance_name(name)
+            if p and p[0] == old_prefix:
+                targets[name] = f"{new_prefix}{p[1]}"
+        if not targets:
+            self.log(f"Rename prefix: no {old_prefix}N instances found.")
+            return
+        # An active run would resurrect the old names/paths on its
+        # final sync — cancel all targets first.
+        for old_name in targets:
+            if not self._cancel_and_wait(old_name):
+                self.log(f"Rename aborted: {old_name} is still running.")
+                return
+        # 1. Create the renamed workflow files (nothing deleted yet,
+        #    so a failure here leaves the repo untouched).
+        for old_name, new_name in sorted(targets.items()):
+            fname = inst[old_name]
+            tpl = self._api_json("GET", f"repos/{repo}/contents/.github/workflows/{fname}?ref={branch}")
+            if not tpl or "content" not in tpl:
+                self.log(f"Rename: could not read {fname} — aborting (nothing deleted).")
+                return
+            try:
+                new_text = renamed_workflow(base64.b64decode(tpl["content"]).decode("utf-8"), new_name)
+            except ValueError as e:
+                self.log(f"Rename: {e} — aborting (nothing deleted).")
+                return
+            new_file = f"{new_name}.yml"
+            rc, _ = self._gh_api("PUT", f"repos/{repo}/contents/.github/workflows/{new_file}",
+                                 {"message": f"Rename instance {old_name} to {new_name} (prefix {old_prefix} -> {new_prefix})",
+                                  "content": base64.b64encode(new_text.encode("utf-8")).decode(),
+                                  "branch": branch})
+            if rc != 0:
+                self.log(f"Rename: creating {new_file} failed — aborting (nothing deleted).")
+                return
+            self.log(f"✅ Created {new_file} ({new_name})")
+        # 2. Delete the old workflow files.
+        for old_name, new_name in sorted(targets.items()):
+            fname = inst[old_name]
+            if fname == f"{new_name}.yml":
+                continue
+            meta = self._api_json("GET", f"repos/{repo}/contents/.github/workflows/{fname}?ref={branch}")
+            if meta and meta.get("sha"):
+                rc, _ = self._gh_api("DELETE", f"repos/{repo}/contents/.github/workflows/{fname}",
+                                     {"message": f"Remove old {old_name} workflow file (renamed to {new_name})",
+                                      "sha": meta["sha"], "branch": branch})
+                if rc != 0:
+                    self.log(f"Rename: deleting old {fname} failed — delete it by hand.")
+                else:
+                    self.log(f"✅ Deleted old {fname}")
+        # 3. Move the state dirs in one git-tree commit.
+        moves = [(f"opencode/instances/{o}/", f"opencode/instances/{n}/")
+                 for o, n in sorted(targets.items())]
+        for attempt in range(3):
+            ref = self._api_json("GET", f"repos/{repo}/git/ref/heads/{branch}")
+            head = (ref or {}).get("object", {}).get("sha")
+            if not head:
+                self.log("Rename: could not resolve the branch head.")
+                return
+            tree = self._api_json("GET", f"repos/{repo}/git/trees/{head}?recursive=1", timeout=180)
+            if tree is None:
+                self.log("Rename: could not read the repo tree.")
+                return
+            entries = []
+            for e in tree.get("tree", []):
+                if e.get("type") != "blob":
+                    continue
+                for old_dir, new_dir in moves:
+                    if e["path"].startswith(old_dir):
+                        entries.append({"path": new_dir + e["path"][len(old_dir):],
+                                        "mode": e["mode"], "type": "blob", "sha": e["sha"]})
+                        entries.append({"path": e["path"], "mode": "100644",
+                                        "type": "blob", "sha": None})
+                        break
+            if not entries:
+                self.log("Rename: no instance state to move (fresh repo).")
+                break
+            nt = self._api_json("POST", f"repos/{repo}/git/trees",
+                                {"base_tree": head, "tree": entries}, timeout=180)
+            if not nt:
+                self.log("Rename: creating the move tree failed.")
+                return
+            cm = self._api_json("POST", f"repos/{repo}/git/commits",
+                                {"message": f"Move instance state for prefix rename {old_prefix} -> {new_prefix}",
+                                 "tree": nt["sha"], "parents": [head]})
+            if not cm:
+                self.log("Rename: creating the move commit failed.")
+                return
+            rc, _ = self._gh_api("PATCH", f"repos/{repo}/git/refs/heads/{branch}", {"sha": cm["sha"]})
+            if rc == 0:
+                self.log(f"✅ Moved state for {len(targets)} instance(s) into opencode/instances/{new_prefix}N/")
+                break
+            self.log(f"Rename: branch moved during the state move (attempt {attempt + 1}/3) — retrying…")
+        else:
+            self.log("Rename: the state move did not land — run Rename again to finish it.")
+            return
+        self.log(f"✅ Prefix renamed {old_prefix} -> {new_prefix}.")
         self.after(0, self.reload_workflows)
         self.after(0, self.refresh_runs)
 
