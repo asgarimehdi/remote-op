@@ -1,0 +1,10 @@
+# local settings (contains your password — never committed)
+settings.json
+dist/settings.json
+
+# PyInstaller build output
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
