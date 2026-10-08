@@ -1,7 +1,9 @@
 """Remote-Op - minimal manager. Settings saved to settings.json."""
+import base64
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -17,7 +19,38 @@ else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
 
-SERVERS = [f"http://open{i}:4096" for i in range(1, 5)]
+INSTANCE_RE = re.compile(r"^open(\d+)$")
+WORKFLOW_FILE_RE = re.compile(r"^op(\d+)\.yml$")
+
+
+def next_free_number(used):
+    """Smallest positive integer not in `used` (fills gaps, e.g. after a delete)."""
+    n = 1
+    while n in used:
+        n += 1
+    return n
+
+
+def server_urls(names):
+    """Uptime URLs derived from workflow names: openN -> http://openN:4096."""
+    nums = sorted(int(m.group(1)) for name in names
+                  for m in [INSTANCE_RE.match(name or "")] if m)
+    return [f"http://open{n}:4096" for n in nums]
+
+
+def renamed_workflow(text, new_name):
+    """An existing workflow file re-pointed at `new_name` (openN).
+
+    Only three spots carry the instance identity: the workflow `name:`,
+    the WF_NAME job env, and the sync-back commit message. Raises
+    ValueError if any marker is missing.
+    """
+    out, n1 = re.subn(r"(?m)^name:\s*open\d+\s*$", f"name: {new_name}", text, count=1)
+    out, n2 = re.subn(r"WF_NAME:\s*open\d+", f"WF_NAME: {new_name}", out, count=1)
+    out, n3 = re.subn(r"from open\d+ instance", f"from {new_name} instance", out, count=1)
+    if not (n1 and n2 and n3):
+        raise ValueError("template is missing name:/WF_NAME:/commit-message markers")
+    return out
 DEFAULTS = {"repo": "", "password": "", "branch": ""}
 
 
@@ -85,6 +118,8 @@ class App(tk.Tk):
         ttk.Button(wb, text="Reload from remote", command=self.reload_workflows).pack(side="left", padx=2)
         ttk.Button(wb, text="Run selected", command=self.run_selected).pack(side="left", padx=2)
         ttk.Button(wb, text="Run ALL", command=self.run_all).pack(side="left", padx=2)
+        ttk.Button(wb, text="Add instance", command=self.add_instance).pack(side="left", padx=2)
+        ttk.Button(wb, text="Delete selected", command=self.delete_instance).pack(side="left", padx=2)
         self.wf_tree = ttk.Treeview(w, columns=("name", "state"), show="headings", height=6)
         self.wf_tree.heading("name", text="workflow")
         self.wf_tree.heading("state", text="state")
@@ -118,17 +153,9 @@ class App(tk.Tk):
         ttk.Label(uh, textvariable=self.uptime_var).pack(side="left")
         ttk.Button(uh, text="Check now", command=lambda: self.run_bg(self._check_uptime)).pack(side="right")
         self.srv_labels = {}
-        for url in SERVERS:
-            row = ttk.Frame(u)
-            row.pack(fill="x")
-            link = tk.Label(row, text=url, width=22, fg="blue", cursor="hand2", font=("TkDefaultFont", 9, "underline"))
-            link.pack(side="left")
-            link.bind("<Button-1>", lambda e, u=url: webbrowser.open(u))
-            lbl = ttk.Label(row, text="… checking", foreground="gray")
-            lbl.pack(side="left", padx=8)
-            self.srv_labels[url] = lbl
-            ttk.Button(row, text="Connect", width=9,
-                       command=lambda u=url: self.connect_server(u)).pack(side="right", padx=2)
+        self.servers = []  # rebuilt from the loaded workflow names
+        self.srv_frame = ttk.Frame(u)
+        self.srv_frame.pack(fill="x")
 
         # log
         lf = ttk.LabelFrame(self, text="Log", padding=6)
@@ -204,6 +231,44 @@ class App(tk.Tk):
             self.log(f"ERROR: {e}")
             return 1, ""
 
+    def _gh_api(self, method, endpoint, body=None, timeout=120):
+        """`gh api` call with the repo embedded in the endpoint (`gh api`
+        does not take the --repo flag _gh appends). Returns (rc, stdout)."""
+        cmd = ["gh", "api", endpoint, "-X", method]
+        inp = None
+        if body is not None:
+            cmd += ["--input", "-"]
+            inp = json.dumps(body)
+        self.log("$ " + " ".join(cmd))
+        no_window = {}
+        if os.name == "nt":
+            no_window["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            no_window["startupinfo"] = si
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, input=inp,
+                               cwd=APP_DIR, timeout=timeout, **no_window)
+            if p.returncode != 0 and p.stderr.strip():
+                self.log(p.stderr.strip()[:2000])
+            return p.returncode, p.stdout
+        except FileNotFoundError:
+            self.log("ERROR: `gh` not found in PATH.")
+            return 1, ""
+        except Exception as e:
+            self.log(f"ERROR: {e}")
+            return 1, ""
+
+    def _api_json(self, method, endpoint, body=None, timeout=120):
+        rc, out = self._gh_api(method, endpoint, body, timeout)
+        if rc != 0:
+            return None
+        try:
+            return json.loads(out or "null")
+        except Exception as e:
+            self.log(f"Parse error: {e}")
+            return None
+
     # ----- workflows -----
     def reload_workflows(self):
         self.run_bg(self._reload_workflows)
@@ -224,6 +289,7 @@ class App(tk.Tk):
             self.wf_tree.delete(i)
         for r in rows:
             self.wf_tree.insert("", "end", values=(r.get("name"), r.get("state")))
+        self._rebuild_servers([r.get("name") for r in rows])
         self.log(f"{len(rows)} workflows loaded.")
 
     def _wf_names(self, selected_only):
@@ -372,13 +438,187 @@ class App(tk.Tk):
             self._gh(["run", "delete", rid])
         self._refresh_runs_sync()
 
+    # ----- instances: add / delete -----
+    def _rebuild_servers(self, names):
+        """Rebuild the uptime rows from the loaded workflow names, so a
+        newly added instance appears (and a deleted one disappears)."""
+        urls = server_urls(names)
+        if urls == self.servers:
+            return
+        self.servers = urls
+        for child in self.srv_frame.winfo_children():
+            child.destroy()
+        self.srv_labels = {}
+        self.up_since = {u: t for u, t in self.up_since.items() if u in urls}
+        for url in urls:
+            row = ttk.Frame(self.srv_frame)
+            row.pack(fill="x")
+            link = tk.Label(row, text=url, width=22, fg="blue", cursor="hand2",
+                            font=("TkDefaultFont", 9, "underline"))
+            link.pack(side="left")
+            link.bind("<Button-1>", lambda e, u=url: webbrowser.open(u))
+            lbl = ttk.Label(row, text="… checking", foreground="gray")
+            lbl.pack(side="left", padx=8)
+            self.srv_labels[url] = lbl
+            ttk.Button(row, text="Connect", width=9,
+                       command=lambda u=url: self.connect_server(u)).pack(side="right", padx=2)
+
+    def add_instance(self):
+        self.run_bg(self._add_instance)
+
+    def _add_instance(self):
+        repo = self.repo_var.get().strip()
+        branch = self.branch_var.get().strip() or "opc"
+        if not repo:
+            self.log("Add instance: set the repo in Settings first.")
+            return
+        listing = self._api_json("GET", f"repos/{repo}/contents/.github/workflows?ref={branch}")
+        if not isinstance(listing, list):
+            self.log("Add instance: could not list .github/workflows.")
+            return
+        files = {}
+        for e in listing:
+            m = WORKFLOW_FILE_RE.match(e.get("name", ""))
+            if m:
+                files[int(m.group(1))] = e["name"]
+        if not files:
+            self.log("Add instance: no opN.yml template found in the repo.")
+            return
+        new_num = next_free_number(set(files))
+        new_name = f"open{new_num}"
+        template_name = files[min(files)]
+        tpl = self._api_json("GET", f"repos/{repo}/contents/.github/workflows/{template_name}?ref={branch}")
+        if not tpl or "content" not in tpl:
+            self.log(f"Add instance: could not read template {template_name}.")
+            return
+        try:
+            new_text = renamed_workflow(base64.b64decode(tpl["content"]).decode("utf-8"), new_name)
+        except ValueError as e:
+            self.log(f"Add instance: {e}")
+            return
+        body = {"message": f"Add {new_name} workflow (copied from {template_name})",
+                "content": base64.b64encode(new_text.encode("utf-8")).decode(),
+                "branch": branch}
+        rc, _ = self._gh_api("PUT", f"repos/{repo}/contents/.github/workflows/op{new_num}.yml", body)
+        if rc != 0:
+            self.log(f"Add instance: creating op{new_num}.yml failed.")
+            return
+        self.log(f"✅ Created .github/workflows/op{new_num}.yml — {new_name} starts with a "
+                 f"clean state and creates opencode/instances/{new_name}/ on its first sync.")
+        self.after(3000, self.reload_workflows)
+
+    def delete_instance(self):
+        names = self._wf_names(True)
+        if not names:
+            return
+        name = names[0]
+        m = INSTANCE_RE.match(name)
+        if not m:
+            messagebox.showwarning("Delete instance", f"{name} is not an openN instance.")
+            return
+        fname = f"op{m.group(1)}.yml"
+        if not messagebox.askyesno(
+                "Delete instance",
+                f"Delete {name} completely?\n\n"
+                f"• workflow file .github/workflows/{fname}\n"
+                f"• ALL its data under opencode/instances/{name}/ "
+                f"(sessions, caches, 9router db)\n\n"
+                f"The shared opencode/config (skills etc.) is NOT touched.\n"
+                f"If {name} has an active run, it will be cancelled first."):
+            return
+        self.run_bg(self._delete_instance, name)
+
+    def _delete_instance(self, name):
+        repo = self.repo_var.get().strip()
+        branch = self.branch_var.get().strip() or "opc"
+        if not repo:
+            self.log("Delete instance: set the repo in Settings first.")
+            return
+        num = INSTANCE_RE.match(name).group(1)
+        # 1. Stop an active run first: its final sync-back would
+        #    resurrect the data deleted below.
+        if name in self._active_workflows():
+            self.log(f"{name} has an active run — cancelling it before delete…")
+            rc, out = self._gh(["run", "list", "--limit", "50", "--json",
+                                "databaseId,workflowName,status,headBranch"])
+            ids = []
+            if rc == 0:
+                try:
+                    ids = [str(r["databaseId"]) for r in json.loads(out or "[]")
+                           if r.get("workflowName") == name
+                           and r.get("status") in self.ACTIVE_STATUSES
+                           and r.get("headBranch") == branch]
+                except Exception:
+                    ids = []
+            for rid in ids:
+                self._gh(["run", "cancel", rid])
+            for _ in range(36):  # up to ~3 min for the final sync to finish
+                time.sleep(5)
+                if name not in self._active_workflows():
+                    break
+            if name in self._active_workflows():
+                self.log(f"Delete aborted: {name} is still running.")
+                return
+        # 2. Delete the workflow file.
+        meta = self._api_json("GET", f"repos/{repo}/contents/.github/workflows/op{num}.yml?ref={branch}")
+        if meta and meta.get("sha"):
+            rc, _ = self._gh_api("DELETE", f"repos/{repo}/contents/.github/workflows/op{num}.yml",
+                                 {"message": f"Remove {name} workflow",
+                                  "sha": meta["sha"], "branch": branch})
+            if rc != 0:
+                self.log(f"Delete: removing op{num}.yml failed — aborting before the data delete.")
+                return
+            self.log(f"✅ Deleted .github/workflows/op{num}.yml")
+        else:
+            self.log(f"Delete: op{num}.yml not found (already gone?) — continuing with the data.")
+        # 3. Delete opencode/instances/<name>/ in one git-tree commit.
+        prefix = f"opencode/instances/{name}/"
+        for attempt in range(3):
+            ref = self._api_json("GET", f"repos/{repo}/git/ref/heads/{branch}")
+            head = (ref or {}).get("object", {}).get("sha")
+            if not head:
+                self.log("Delete: could not resolve the branch head.")
+                return
+            tree = self._api_json("GET", f"repos/{repo}/git/trees/{head}?recursive=1", timeout=180)
+            if tree is None:
+                self.log("Delete: could not read the repo tree.")
+                return
+            paths = [e["path"] for e in tree.get("tree", [])
+                     if e.get("type") == "blob" and e["path"].startswith(prefix)]
+            if not paths:
+                self.log(f"No data under {prefix} (already clean).")
+                break
+            dels = [{"path": pth, "mode": "100644", "type": "blob", "sha": None} for pth in paths]
+            nt = self._api_json("POST", f"repos/{repo}/git/trees",
+                                {"base_tree": head, "tree": dels}, timeout=180)
+            if not nt:
+                self.log("Delete: creating the deletion tree failed.")
+                return
+            cm = self._api_json("POST", f"repos/{repo}/git/commits",
+                                {"message": f"Remove {name} instance data",
+                                 "tree": nt["sha"], "parents": [head]})
+            if not cm:
+                self.log("Delete: creating the deletion commit failed.")
+                return
+            rc, _ = self._gh_api("PATCH", f"repos/{repo}/git/refs/heads/{branch}", {"sha": cm["sha"]})
+            if rc == 0:
+                self.log(f"✅ Deleted {len(paths)} files under {prefix}")
+                break
+            self.log(f"Delete: branch moved during delete (attempt {attempt + 1}/3) — retrying…")
+        else:
+            self.log("Delete: data delete did not land — run Delete again.")
+            return
+        self.log(f"✅ {name} deleted. Shared opencode/config untouched.")
+        self.after(0, self.reload_workflows)
+        self.after(0, self.refresh_runs)
+
     # ----- uptime every 5 min -----
     def _uptime_loop(self):
         self.run_bg(self._check_uptime)
         self.after(5 * 60 * 1000, self._uptime_loop)  # every 5 min
 
     def _check_uptime(self):
-        for url in SERVERS:
+        for url in list(self.servers):
             ok = self._ping(url)
             now = time.strftime("%H:%M:%S")
             if ok:
