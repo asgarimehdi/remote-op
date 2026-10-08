@@ -12,20 +12,29 @@ Minimal Tkinter desktop app to manage GitHub Actions workflows and watch
   Run one or all (`gh workflow run <name> --repo <repo> --ref <branch>`).
   A workflow that already has an active run on the branch is skipped, and
   only one trigger batch runs at a time.
-- **Add instance** — creates the next free `openN` workflow: copies the
-  lowest-numbered `opN.yml`, renames it (workflow name, `WF_NAME`, sync
-  commit message) and commits it via the API. Gaps are filled first (with
+- **Add instance** — creates the next free instance in the repo's
+  current prefix: copies the lowest-numbered instance's workflow file,
+  renames it (workflow name, `WF_NAME`, sync commit message) and commits
+  it via the API as `<prefix><N>.yml`. Gaps are filled first (with
   open1/open2/open4 present, Add creates open3). The new instance starts
-  with a clean state and creates `opencode/instances/openN/` on its
-  first sync.
+  with a clean state and creates `opencode/instances/<prefix><N>/` on
+  its first sync.
 - **Delete selected** — deletes an instance completely: its workflow
   file plus ALL of its data under `opencode/instances/openN/` (one
   commit). The shared `opencode/config` is never touched. If the
   instance has an active run it is cancelled first — its final sync
   would otherwise resurrect the deleted data.
 - **Runs** — refresh list, cancel selected / cancel ALL, delete ALL.
-- **Uptime** — one row per loaded workflow (`openN` → `http://openN:4096`),
+- **Uptime** — one row per loaded workflow (`<prefix>N` → `http://<prefix>N:4096`),
   UP/DOWN + uptime counter, auto-checked every 5 minutes. URLs are clickable.
+- **Rename prefix…** — for forks that share one Tailscale network with
+  the original repo: renames the instance prefix in the configured repo
+  (workflow files, names and `WF_NAME`, e.g. `open1` → `fork1`) and moves
+  each instance's data `opencode/instances/openN/` → `forkN/` in one
+  commit, so both repos can run side by side without hostname or
+  h-dashboard-branch collisions. Active runs are cancelled first.
+  h-dashboard branches are NOT renamed (new ones are created on the
+  next runs; the old ones stay as leftovers).
   Each server has a **Connect** button that opens a terminal and runs
   `opencode --server <url>` with the password set.
 
