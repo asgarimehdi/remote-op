@@ -78,8 +78,8 @@ and writes `settings.json` next to itself.
 ## Build the exe
 
 ```sh
-pip install pyinstaller
-pyinstaller --onefile --windowed --name RemoteOp app.py
+python -m pip install pyinstaller
+python -m PyInstaller --onefile --windowed --name RemoteOp app.py
 ```
 
 Close any running `RemoteOp.exe` before rebuilding (Windows locks it).
