@@ -1,5 +1,12 @@
 {
-  "repo": "",
-  "password": "",
-  "branch": ""
+  "repos": [
+    {
+      "label": "haileen5",
+      "pat": "",
+      "repo": "haileen5/my-opencode",
+      "branch": "opc",
+      "password": ""
+    }
+  ],
+  "active": "haileen5"
 }

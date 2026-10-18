@@ -1,27 +1,90 @@
-"""Remote-Op - minimal manager. Settings saved to settings.json."""
+#!/usr/bin/env python3
+"""
+Remote-Op — multi-repo manager for the my-opencode runner fleets.
+
+Rebuilt on the RemoteHermes pattern (2026-10-18): pure stdlib (urllib)
+against the GitHub REST API — no `gh` CLI needed for the API calls —
+a checkbox fleet tree grouped by repo, one execution model (Run
+checked / Stop checked), an operation indicator with a serialized op
+lock, parallel + progressive loading, and the RemoteHermes light theme.
+
+Each configured repo holds one workflow file per OpenCode instance
+(op1/open2, rey1..rey11 style): state lives per instance under
+opencode/instances/<wf>/, the shared opencode/config is NEVER touched
+by this app, and instances are told apart only by their WF_NAME (the
+WF_NAME inside the file is authoritative — file names have varied,
+e.g. op1.yml hosts open1).
+
+Fleet operations added on the Hermes basis:
+
+  * Delete checked — tick any machines (across repos) and delete them
+    all: active runs are cancelled and awaited first, then, per repo,
+    the workflow files + every instance's state go in ONE commit.
+  * Create N from first machine — give a number (e.g. 10) and that
+    many new instances are cloned from the repo's first (lowest-
+    numbered) machine, gap-filling the numbering, in ONE commit.
+    With no machine left, the template is recovered from git history,
+    as before.
+
+Each repo may carry its own PAT; a repo without one falls back to the
+token of the locally logged-in gh CLI account. The per-repo OpenCode
+server password is used by Connect (exported as
+OPENCODE_SERVER_PASSWORD, with the legacy OPENCODE_PASSWORD alongside)
+and persisted with setx on Windows when the repos are saved.
+
+Settings live in settings.json next to the program — beside the .exe
+in a PyInstaller build, beside this file when run as a script (keep
+it private: it holds the PATs and passwords). An old-format
+settings.json (single repo/password/branch) is migrated on load.
+"""
+
 import base64
 import json
 import os
-import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext, simpledialog
+import urllib.error
 import urllib.request
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from tkinter import messagebox, scrolledtext, simpledialog, ttk
 
-if getattr(sys, "frozen", False):
-    APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
-else:
-    APP_DIR = os.path.dirname(os.path.abspath(__file__))
-SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
+RUN_BUDGET_MIN = 340  # fallback; the real value is parsed per workflow file
+
+
+def _app_dir():
+    """Folder the settings file lives in: next to the program.
+
+    When frozen (PyInstaller), __file__ points inside the bundle — in
+    a --onefile build that is the _MEIPASS temp extraction dir, which
+    PyInstaller deletes when the app exits, so a settings.json written
+    there silently vanishes and never appears next to the exe. Use the
+    exe's own folder instead. When run as a plain script, keep the
+    original rule: this file's folder.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+APP_DIR = _app_dir()
+SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
 
 NAME_RE = re.compile(r"^(.*?)(\d+)$")
 PREFIX_RE = re.compile(r"^[a-z]([a-z0-9-]*[a-z])?$")
+TIMEOUT_RE = re.compile(r"timeout-minutes:\s*(\d+)")
+ACTIVE_STATUSES = ("queued", "in_progress", "waiting", "pending", "requested")
 
+
+# ---------------------------------------------------------------------------
+# Pure helpers
+# ---------------------------------------------------------------------------
 
 def parse_instance_name(name):
     """'open3' -> ('open', 3); 'mehdi12' -> ('mehdi', 12); else None.
@@ -47,11 +110,20 @@ def next_free_number(used):
     return n
 
 
-def server_urls(names):
-    """Uptime URLs derived from workflow names: <prefix>N -> http://<prefix>N:4096."""
-    parsed = [p for p in (parse_instance_name(n) for n in names) if p]
-    parsed.sort(key=lambda pn: (pn[0], pn[1]))
-    return [f"http://{p}{n}:4096" for p, n in parsed]
+def plan_new_numbers(used, count):
+    """The `count` instance numbers a bulk create will take, in order.
+
+    Gap-filling, exactly like repeated single Adds: every number is
+    the smallest free one at its turn, so [used={2,3}, count=3]
+    plans [1, 4, 5].
+    """
+    taken = set(used)
+    out = []
+    for _ in range(max(0, count)):
+        n = next_free_number(taken)
+        taken.add(n)
+        out.append(n)
+    return out
 
 
 def workflow_instance(text):
@@ -80,706 +152,1521 @@ def renamed_workflow(text, new_name):
     return out
 
 
-DEFAULTS = {"repo": "", "password": "", "branch": ""}
+def workflow_timeout(text):
+    """The workflow's timeout-minutes, or the fleet fallback."""
+    m = TIMEOUT_RE.search(text or "")
+    return int(m.group(1)) if m else RUN_BUDGET_MIN
 
 
-def load_settings():
-    if os.path.exists(SETTINGS_FILE):
+def remaining_minutes(run_created_iso, timeout_min, now=None):
+    """Minutes of run budget left for an in-progress run."""
+    if not run_created_iso:
+        return None
+    now = now or datetime.now(timezone.utc)
+    started = datetime.fromisoformat(run_created_iso.replace("Z", "+00:00"))
+    elapsed = (now - started).total_seconds() / 60.0
+    return int(timeout_min - elapsed)
+
+
+def fmt_remaining(mins):
+    if mins is None:
+        return "—"
+    if mins < 0:
+        return "overdue"
+    h, m = divmod(mins, 60)
+    return f"{h}h{m:02d}m left" if h else f"{m}m left"
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+def blank_repo():
+    return {"label": "", "pat": "", "repo": "", "branch": "opc",
+            "password": ""}
+
+
+def _label_for(repo_slug):
+    """Default tree label for a repo slug: its owner (haileen5/my-opencode
+    and Shabakebehdasht/my-opencode meet in the tree by owner)."""
+    return repo_slug.split("/")[0] if "/" in repo_slug else repo_slug
+
+
+def load_settings(path=None):
+    """Settings dict; an old single-repo settings.json is migrated.
+
+    Old format: {"repo": ..., "password": ..., "branch": ...} becomes
+    one entry in "repos" (label = the repo's owner). A file that
+    cannot be parsed yields an empty fleet rather than a crash.
+    """
+    path = path or SETTINGS_PATH
+    data = {}
+    if os.path.exists(path):
         try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                d = json.load(f)
-            m = dict(DEFAULTS)
-            m.update({k: d[k] for k in DEFAULTS if k in d})
-            # migrate old "ref" key
-            if "branch" not in m and "ref" in d:
-                m["branch"] = d["ref"]
-            return m
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
         except Exception:
-            pass
-    return dict(DEFAULTS)
+            data = {}
+    repos = []
+    for r in data.get("repos", []) if isinstance(data, dict) else []:
+        e = blank_repo()
+        e.update({k: r[k] for k in e if k in r})
+        if e["repo"] and not e["label"]:
+            e["label"] = _label_for(e["repo"])
+        repos.append(e)
+    if not repos and isinstance(data, dict) and data.get("repo"):
+        e = blank_repo()
+        e.update({"repo": data["repo"],
+                  "password": data.get("password", ""),
+                  "branch": data.get("branch") or data.get("ref") or "opc",
+                  "label": _label_for(data["repo"])})
+        repos.append(e)
+    return {"repos": repos,
+            "active": data.get("active", "") if isinstance(data, dict) else "",
+            "hide_cancelled": bool(data.get("hide_cancelled"))
+            if isinstance(data, dict) else False}
 
 
-def save_settings(d):
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(d, f, indent=2)
+def save_settings(settings, path=None):
+    with open(path or SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2, ensure_ascii=False)
 
 
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Remote-Op")
-        self.geometry("800x750")
-        self.settings = load_settings()
-        self.log_q = queue.Queue()
-        self.up_since = {}  # url -> timestamp when first seen UP
-        self._triggering = False  # only one workflow trigger batch at a time
-        self._inst_busy = False  # only one add/delete/rename at a time
-        # OpenCode V2's client reads the server password from
-        # OPENCODE_SERVER_PASSWORD (the V1-era OPENCODE_PASSWORD is kept
-        # alongside it for any older tooling that still looks for it).
-        os.environ["OPENCODE_PASSWORD"] = self.settings.get("password", "")
-        os.environ["OPENCODE_SERVER_PASSWORD"] = self.settings.get("password", "")
-        self._build()
-        self.after(100, self._drain_log)
-        # initial load + start 5-min uptime loop
-        self.after(500, self.reload_workflows)
-        self.after(500, self.refresh_runs)
-        self.after(1000, self._uptime_loop)
+# ---------------------------------------------------------------------------
+# GitHub REST client (one instance per repo entry)
+# ---------------------------------------------------------------------------
 
-    # ----- UI -----
-    def _build(self):
-        # settings
-        s = ttk.LabelFrame(self, text="Settings", padding=8)
-        s.pack(fill="x", padx=8, pady=6)
-        self.repo_var = tk.StringVar(value=self.settings["repo"])
-        self.pass_var = tk.StringVar(value=self.settings["password"])
-        self.branch_var = tk.StringVar(value=self.settings["branch"])
-        ttk.Label(s, text="Repo:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(s, textvariable=self.repo_var, width=32).grid(row=0, column=1, padx=4)
-        ttk.Label(s, text="Pass:").grid(row=0, column=2, sticky="w")
-        self._pass_entry = ttk.Entry(s, textvariable=self.pass_var, width=14, show="*")
-        self._pass_entry.grid(row=0, column=3, padx=4)
-        ttk.Button(s, text="show", width=5, command=self._toggle_pass).grid(row=0, column=4)
-        ttk.Label(s, text="Branch:").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(s, textvariable=self.branch_var, width=20).grid(row=1, column=1, sticky="w", pady=(6, 0))
-        ttk.Button(s, text="Save", command=self.on_save).grid(row=1, column=3, pady=(6, 0))
+_gh_cli_token_cache = {"t": None}
 
-        # workflows
-        w = ttk.LabelFrame(self, text="Workflows (from remote)", padding=8)
-        w.pack(fill="both", expand=True, padx=8, pady=4)
-        wb = ttk.Frame(w)
-        wb.pack(fill="x")
-        ttk.Button(wb, text="Reload from remote", command=self.reload_workflows).pack(side="left", padx=2)
-        ttk.Button(wb, text="Run selected", command=self.run_selected).pack(side="left", padx=2)
-        ttk.Button(wb, text="Run ALL", command=self.run_all).pack(side="left", padx=2)
-        ttk.Button(wb, text="Add instance", command=self.add_instance).pack(side="left", padx=2)
-        ttk.Button(wb, text="Delete selected", command=self.delete_instance).pack(side="left", padx=2)
-        ttk.Button(wb, text="Rename prefix…", command=self.rename_prefix).pack(side="left", padx=2)
-        self.wf_tree = ttk.Treeview(w, columns=("name", "state"), show="headings", height=6)
-        self.wf_tree.heading("name", text="workflow")
-        self.wf_tree.heading("state", text="state")
-        self.wf_tree.column("name", width=300)
-        self.wf_tree.column("state", width=120)
-        self.wf_tree.pack(fill="both", expand=True, pady=(6, 0))
 
-        # runs (for cancel / delete)
-        r = ttk.LabelFrame(self, text="Runs (cancel / delete one / all)", padding=8)
-        r.pack(fill="both", expand=True, padx=8, pady=4)
-        rb = ttk.Frame(r)
-        rb.pack(fill="x")
-        ttk.Button(rb, text="Refresh", command=self.refresh_runs).pack(side="left", padx=2)
-        ttk.Button(rb, text="Cancel selected", command=self.cancel_selected).pack(side="left", padx=2)
-        ttk.Button(rb, text="Cancel ALL", command=self.cancel_all).pack(side="left", padx=2)
-        ttk.Button(rb, text="Delete ALL", command=self.delete_all).pack(side="left", padx=2)
-        self.run_tree = ttk.Treeview(r, columns=("num", "wf", "status", "branch", "dbid"),
-                                     show="headings", height=6)
-        for c, t, wd in [("num", "#", 60), ("wf", "workflow", 200),
-                         ("status", "status", 110), ("branch", "branch", 110), ("dbid", "id", 110)]:
-            self.run_tree.heading(c, text=t)
-            self.run_tree.column(c, width=wd)
-        self.run_tree.pack(fill="both", expand=True, pady=(6, 0))
+def gh_cli_token():
+    """Token of the locally logged-in gh CLI account, or None.
 
-        # uptime (every 5 min)
-        u = ttk.LabelFrame(self, text="Uptime — checked every 5 min", padding=8)
-        u.pack(fill="x", padx=8, pady=4)
-        uh = ttk.Frame(u)
-        uh.pack(fill="x")
-        self.uptime_var = tk.StringVar(value="last check: never")
-        ttk.Label(uh, textvariable=self.uptime_var).pack(side="left")
-        ttk.Button(uh, text="Check now", command=lambda: self.run_bg(self._check_uptime)).pack(side="right")
-        self.srv_labels = {}
-        self.servers = []  # rebuilt from the loaded workflow names
-        self.srv_frame = ttk.Frame(u)
-        self.srv_frame.pack(fill="x")
+    Used for repos with no PAT of their own. Only a successful lookup
+    is cached.
+    """
+    if _gh_cli_token_cache["t"]:
+        return _gh_cli_token_cache["t"]
+    exe = shutil.which("gh")
+    if not exe:
+        return None
+    try:
+        r = subprocess.run([exe, "auth", "token"], capture_output=True,
+                           text=True, timeout=15)
+    except Exception:
+        return None
+    tok = (r.stdout or "").strip()
+    if r.returncode == 0 and tok:
+        _gh_cli_token_cache["t"] = tok
+        return tok
+    return None
 
-        # log
-        lf = ttk.LabelFrame(self, text="Log", padding=6)
-        lf.pack(fill="both", expand=False, padx=8, pady=(0, 8))
-        self.log_text = scrolledtext.ScrolledText(lf, height=6, state="disabled", font=("Consolas", 9))
-        self.log_text.pack(fill="both", expand=True)
 
-    def _toggle_pass(self):
-        self._pass_entry.config(show="" if self._pass_entry.cget("show") == "*" else "*")
+class GH:
+    def __init__(self, pat):
+        self.pat = (pat or "").strip()
 
-    # ----- settings -----
-    def on_save(self):
-        self.settings = {"repo": self.repo_var.get().strip(),
-                         "password": self.pass_var.get(),
-                         "branch": self.branch_var.get().strip() or "opc"}
-        save_settings(self.settings)
-        # set $env:OPENCODE_SERVER_PASSWORD (what the OpenCode V2 client
-        # reads) + $env:OPENCODE_PASSWORD (legacy) for this process, and
-        # persist both for future cmd/PowerShell sessions
-        os.environ["OPENCODE_PASSWORD"] = self.settings["password"]
-        os.environ["OPENCODE_SERVER_PASSWORD"] = self.settings["password"]
-        self.log(f"$env:OPENCODE_SERVER_PASSWORD set ({len(self.settings['password'])} chars)")
-        self.log(f"Saved: {self.settings['repo']} / branch={self.settings['branch']}")
-        if os.name == "nt":
+    def _token(self):
+        return self.pat or gh_cli_token()
+
+    def api(self, method, path, body=None, timeout=90):
+        tok = self._token()
+        if not tok:
+            return 0, {"message": "No PAT set for this repo and no gh "
+                                  "CLI login found — set a PAT in the "
+                                  "repo, or run `gh auth login`."}
+        url = "https://api.github.com/" + path
+        data = json.dumps(body).encode() if body is not None else None
+        headers = {
+            "Authorization": f"Bearer {tok}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "Remote-Op/2.0",
+        }
+        if data:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+                return resp.status, (json.loads(raw) if raw else {})
+        except urllib.error.HTTPError as e:
+            raw = e.read()
             try:
-                si = subprocess.STARTUPINFO()
-                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                for var in ("OPENCODE_SERVER_PASSWORD", "OPENCODE_PASSWORD"):
-                    subprocess.run(["setx", var, self.settings["password"]],
-                                   capture_output=True, text=True, timeout=15,
-                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
-                                   startupinfo=si)
-                self.log("Persisted via setx — new terminals will have OPENCODE_SERVER_PASSWORD.")
-            except Exception as e:
-                self.log(f"setx failed (session-only): {e}")
+                return e.code, json.loads(raw)
+            except Exception:
+                return e.code, {"message": raw.decode("utf-8", "replace")[:200]}
+        except Exception as e:  # network errors etc.
+            return 0, {"message": str(e)}
 
-    # ----- helpers -----
-    def log(self, msg):
-        self.log_q.put(msg)
+    # -- repo content ------------------------------------------------------
+    def list_instances(self, repo, branch):
+        """{wf_name: {file, sha, text, timeout}} for the repo.
 
-    def _drain_log(self):
-        try:
-            while True:
-                m = self.log_q.get_nowait()
-                self.log_text.config(state="normal")
-                self.log_text.insert("end", m + "\n")
-                self.log_text.see("end")
-                self.log_text.config(state="disabled")
-        except queue.Empty:
-            pass
-        self.after(100, self._drain_log)
-
-    def run_bg(self, fn, *a):
-        threading.Thread(target=fn, args=a, daemon=True).start()
-
-    def _gh(self, args):
-        cmd = ["gh"] + args + ["--repo", self.repo_var.get().strip()]
-        self.log("$ " + " ".join(cmd))
-        # hide console window on Windows (no cmd flash)
-        no_window = {}
-        if os.name == "nt":
-            no_window["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            no_window["startupinfo"] = si
-        try:
-            p = subprocess.run(cmd, capture_output=True, text=True, cwd=APP_DIR, timeout=60, **no_window)
-            if p.stdout.strip():
-                self.log(p.stdout.strip()[:2000])
-            if p.returncode != 0 and p.stderr.strip():
-                self.log(p.stderr.strip()[:2000])
-            return p.returncode, p.stdout
-        except FileNotFoundError:
-            self.log("ERROR: `gh` not found in PATH.")
-            return 1, ""
-        except Exception as e:
-            self.log(f"ERROR: {e}")
-            return 1, ""
-
-    def _gh_api(self, method, endpoint, body=None, timeout=120):
-        """`gh api` call with the repo embedded in the endpoint (`gh api`
-        does not take the --repo flag _gh appends). Returns (rc, stdout)."""
-        cmd = ["gh", "api", endpoint, "-X", method]
-        inp = None
-        if body is not None:
-            cmd += ["--input", "-"]
-            inp = json.dumps(body)
-        self.log("$ " + " ".join(cmd))
-        no_window = {}
-        if os.name == "nt":
-            no_window["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            no_window["startupinfo"] = si
-        try:
-            p = subprocess.run(cmd, capture_output=True, text=True, input=inp,
-                               cwd=APP_DIR, timeout=timeout, **no_window)
-            if p.returncode != 0 and p.stderr.strip():
-                self.log(p.stderr.strip()[:2000])
-            return p.returncode, p.stdout
-        except FileNotFoundError:
-            self.log("ERROR: `gh` not found in PATH.")
-            return 1, ""
-        except Exception as e:
-            self.log(f"ERROR: {e}")
-            return 1, ""
-
-    def _api_json(self, method, endpoint, body=None, timeout=120):
-        rc, out = self._gh_api(method, endpoint, body, timeout)
-        if rc != 0:
-            return None
-        try:
-            return json.loads(out or "null")
-        except Exception as e:
-            self.log(f"Parse error: {e}")
-            return None
-
-    # ----- workflows -----
-    def reload_workflows(self):
-        self.run_bg(self._reload_workflows)
-
-    def _reload_workflows(self):
-        rc, out = self._gh(["workflow", "list", "--json", "name,state", "--limit", "50"])
-        if rc != 0:
-            return
-        try:
-            rows = json.loads(out or "[]")
-        except Exception as e:
-            self.log(f"Parse error: {e}")
-            return
-        self.after(0, lambda: self._fill_wf(rows))
-
-    def _fill_wf(self, rows):
-        for i in self.wf_tree.get_children():
-            self.wf_tree.delete(i)
-        for r in rows:
-            self.wf_tree.insert("", "end", values=(r.get("name"), r.get("state")))
-        self._rebuild_servers([r.get("name") for r in rows])
-        self.log(f"{len(rows)} workflows loaded.")
-
-    def _wf_names(self, selected_only):
-        items = self.wf_tree.selection() if selected_only else self.wf_tree.get_children()
-        if selected_only and not items:
-            messagebox.showwarning("No selection", "Select a workflow first.")
-            return []
-        return [self.wf_tree.item(i, "values")[0] for i in items]
-
-    def run_selected(self):
-        if self._triggering:
-            self.log("A trigger batch is already running — wait for it to finish.")
-            return
-        names = self._wf_names(True)
-        if names:
-            self.run_bg(self._trigger, names)
-
-    def run_all(self):
-        if self._triggering:
-            self.log("A trigger batch is already running — wait for it to finish.")
-            return
-        names = self._wf_names(False)
-        if not names:
-            self.log("No workflows loaded — press Reload first.")
-            return
-        self.run_bg(self._trigger, names)
-
-    ACTIVE_STATUSES = {"queued", "in_progress", "waiting", "pending", "requested"}
-
-    def _active_workflows(self):
-        """Return set of workflow names with an active run on current branch."""
-        branch = self.branch_var.get().strip() or "opc"
-        rc, out = self._gh(["run", "list", "--limit", "50", "--json",
-                            "workflowName,status,headBranch"])
-        if rc != 0:
-            return set()
-        try:
-            rows = json.loads(out or "[]")
-        except Exception:
-            return set()
-        return {r.get("workflowName") for r in rows
-                if r.get("status") in self.ACTIVE_STATUSES
-                and (not branch or r.get("headBranch") == branch)}
-
-    def _trigger(self, names):
-        if self._triggering:
-            return
-        self._triggering = True
-        try:
-            branch = self.branch_var.get().strip() or "opc"
-            active = self._active_workflows()
-            for n in names:
-                if n in active:
-                    self.log(f"skip {n}: already running @ {branch}")
-                    continue
-                rc, _ = self._gh(["workflow", "run", n, "--ref", branch])
-                if rc == 0:
-                    self.log(f"triggered {n} @ {branch}")
-                    active.add(n)  # prevent double-trigger within same batch
-            self._refresh_runs_sync()
-        finally:
-            self._triggering = False
-
-    def connect_server(self, url):
-        """Open a visible terminal and run opencode --server <url> with password set."""
-        pwd = self.pass_var.get().replace("'", "''")
-        ps_cmd = (f"$env:OPENCODE_SERVER_PASSWORD='{pwd}'; "
-                  f"$env:OPENCODE_PASSWORD='{pwd}'; opencode --server {url}")
-        self.log(f"opencode --server {url} (password via $env:OPENCODE_SERVER_PASSWORD)")
-        try:
-            if os.name == "nt":
-                subprocess.Popen(
-                    ["powershell.exe", "-NoExit", "-Command", ps_cmd],
-                    creationflags=subprocess.CREATE_NEW_CONSOLE,
-                )
-            else:
-                subprocess.Popen(["opencode", "--server", url],
-                                 env={**os.environ,
-                                      "OPENCODE_PASSWORD": self.pass_var.get(),
-                                      "OPENCODE_SERVER_PASSWORD": self.pass_var.get()})
-        except FileNotFoundError:
-            self.log("ERROR: powershell/opencode not found in PATH.")
-        except Exception as e:
-            self.log(f"Connect failed: {e}")
-
-    # ----- runs / cancel -----
-    def refresh_runs(self):
-        self.run_bg(self._refresh_runs_sync)
-
-    def _refresh_runs_sync(self):
-        rc, out = self._gh(["run", "list", "--limit", "50", "--json",
-                            "databaseId,number,workflowName,status,conclusion,headBranch"])
-        if rc != 0:
-            return
-        try:
-            rows = json.loads(out or "[]")
-        except Exception as e:
-            self.log(f"Parse error: {e}")
-            return
-        self.after(0, lambda: self._fill_runs(rows))
-
-    def _fill_runs(self, rows):
-        for i in self.run_tree.get_children():
-            self.run_tree.delete(i)
-        for r in rows:
-            st = r.get("status") or ""
-            if r.get("conclusion"):
-                st += f"/{r['conclusion']}"
-            self.run_tree.insert("", "end", values=(r.get("number"), r.get("workflowName"),
-                                                    st, r.get("headBranch"), r.get("databaseId")))
-
-    def _run_ids(self, selected_only):
-        items = self.run_tree.selection() if selected_only else self.run_tree.get_children()
-        if selected_only and not items:
-            messagebox.showwarning("No selection", "Select a run first.")
-            return []
-        return [str(self.run_tree.item(i, "values")[4]) for i in items]
-
-    def cancel_selected(self):
-        ids = self._run_ids(True)
-        if ids:
-            self.run_bg(self._cancel, ids)
-
-    def cancel_all(self):
-        ids = self._run_ids(False)
-        if not ids:
-            self.log("No runs to cancel.")
-            return
-        if not messagebox.askyesno("Confirm", f"Cancel ALL {len(ids)} runs?"):
-            return
-        self.run_bg(self._cancel, ids)
-
-    def _cancel(self, ids):
-        for rid in ids:
-            self._gh(["run", "cancel", rid])
-        self._refresh_runs_sync()
-
-    def delete_all(self):
-        ids = self._run_ids(False)
-        if not ids:
-            self.log("No runs to delete.")
-            return
-        if not messagebox.askyesno("Confirm", f"DELETE all {len(ids)} runs? (gh run delete)"):
-            return
-        self.run_bg(self._delete, ids)
-
-    def _delete(self, ids):
-        for rid in ids:
-            self._gh(["run", "delete", rid])
-        self._refresh_runs_sync()
-
-    # ----- instances: add / delete -----
-    def _instance_files(self, repo, branch):
-        """{instance_name: workflow_filename} for every workflow file in
-        the repo whose WF_NAME is an instance name (<prefix><number>).
-        The WF_NAME inside the file is authoritative — file names have
-        varied over time (op1.yml hosts open1)."""
-        listing = self._api_json("GET", f"repos/{repo}/contents/.github/workflows?ref={branch}")
-        result = {}
-        if not isinstance(listing, list):
-            return result
+        Only workflow files whose WF_NAME is an instance name
+        (<prefix><number>) count; the WF_NAME inside the file is
+        authoritative, not the file name.
+        """
+        code, listing = self.api("GET", f"repos/{repo}/contents/.github/workflows?ref={branch}")
+        out = {}
+        if code != 200 or not isinstance(listing, list):
+            return out
         for e in listing:
             fname = e.get("name", "")
             if not fname.endswith(".yml"):
                 continue
-            tpl = self._api_json("GET", f"repos/{repo}/contents/.github/workflows/{fname}?ref={branch}")
-            if not tpl or "content" not in tpl:
+            code2, f = self.api("GET", f"repos/{repo}/contents/.github/workflows/{fname}?ref={branch}")
+            if code2 != 200 or "content" not in f:
                 continue
             try:
-                text = base64.b64decode(tpl["content"]).decode("utf-8")
+                text = base64.b64decode(f["content"]).decode("utf-8")
             except Exception:
                 continue
-            name = workflow_instance(text)
-            if name and parse_instance_name(name):
-                result[name] = fname
-        return result
+            wf = workflow_instance(text)
+            if wf and parse_instance_name(wf):
+                out[wf] = {"file": fname, "sha": f["sha"], "text": text,
+                           "timeout": workflow_timeout(text)}
+        return out
 
-    def _history_template(self, repo, branch):
+    def get_file(self, repo, branch, path):
+        code, f = self.api("GET", f"repos/{repo}/contents/{path}?ref={branch}")
+        if code != 200 or "content" not in f:
+            return None, None
+        return base64.b64decode(f["content"]).decode("utf-8"), f["sha"]
+
+    def state_numbers(self, repo, branch):
+        """Instance numbers that have a state dir under
+        opencode/instances/ — a number whose workflow was hand-deleted
+        must not be reused either (its old data would silently revive)."""
+        code, listing = self.api("GET", f"repos/{repo}/contents/opencode/instances?ref={branch}")
+        nums = set()
+        if code == 200 and isinstance(listing, list):
+            for e in listing:
+                p = parse_instance_name(e.get("name", ""))
+                if p:
+                    nums.add(p[1])
+        return nums
+
+    def history_template(self, repo, branch):
         """When no workflow files are left, recover the most recent
-        instance workflow from git history: returns (instance_name,
-        file_text) of the newest deleted workflow that still parses,
-        or None."""
-        commits = self._api_json(
+        instance workflow from git history: (instance_name, text) of
+        the newest commit that still had one, or None."""
+        code, commits = self.api(
             "GET", f"repos/{repo}/commits?sha={branch}&path=.github/workflows&per_page=30")
-        if not isinstance(commits, list):
+        if code != 200 or not isinstance(commits, list):
             return None
         for c in commits:
             sha = c.get("sha")
             if not sha:
                 continue
-            listing = self._api_json(
+            code2, listing = self.api(
                 "GET", f"repos/{repo}/contents/.github/workflows?ref={sha}")
-            if not isinstance(listing, list):
+            if code2 != 200 or not isinstance(listing, list):
                 continue
             for e in listing:
                 fname = e.get("name", "")
                 if not fname.endswith(".yml"):
                     continue
-                tpl = self._api_json(
-                    "GET", f"repos/{repo}/contents/.github/workflows/{fname}?ref={sha}")
-                if not tpl or "content" not in tpl:
-                    continue
-                try:
-                    text = base64.b64decode(tpl["content"]).decode("utf-8")
-                except Exception:
+                text, _ = self.get_file(repo, sha, f".github/workflows/{fname}")
+                if not text:
                     continue
                 name = workflow_instance(text)
                 if name and parse_instance_name(name):
                     return name, text
         return None
 
-    def _cancel_and_wait(self, name, timeout_s=180):
-        """Cancel the workflow's active runs and wait until none are
-        active — a dying run's final sync writes state back, so file /
-        data operations must not race it. Returns True when clear."""
-        if name not in self._active_workflows():
-            return True
-        self.log(f"{name} has an active run — cancelling it first…")
-        branch = self.branch_var.get().strip() or "opc"
-        rc, out = self._gh(["run", "list", "--limit", "50", "--json",
-                            "databaseId,workflowName,status,headBranch"])
-        ids = []
-        if rc == 0:
-            try:
-                ids = [str(r["databaseId"]) for r in json.loads(out or "[]")
-                       if r.get("workflowName") == name
-                       and r.get("status") in self.ACTIVE_STATUSES
-                       and r.get("headBranch") == branch]
-            except Exception:
-                ids = []
-        for rid in ids:
-            self._gh(["run", "cancel", rid])
-        waited = 0
-        while waited < timeout_s:
-            time.sleep(5)
-            waited += 5
-            if name not in self._active_workflows():
+    # -- actions -----------------------------------------------------------
+    def list_runs(self, repo, per_page=100):
+        code, d = self.api("GET", f"repos/{repo}/actions/runs?per_page={per_page}")
+        if code != 200 or not isinstance(d, dict):
+            return []
+        return d.get("workflow_runs", [])
+
+    def list_completed_runs(self, repo, limit=500):
+        """Completed runs only (GitHub refuses to delete active ones),
+        newest first, paged until `limit`."""
+        out, page = [], 1
+        while len(out) < limit:
+            code, d = self.api(
+                "GET", f"repos/{repo}/actions/runs?status=completed"
+                       f"&per_page=100&page={page}")
+            if code != 200 or not isinstance(d, dict):
+                break
+            batch = d.get("workflow_runs", [])
+            if not batch:
+                break
+            out.extend(batch)
+            page += 1
+        return out[:limit]
+
+    def delete_run(self, repo, run_id):
+        code, _ = self.api("DELETE", f"repos/{repo}/actions/runs/{run_id}")
+        return code == 204
+
+    def dispatch(self, repo, branch, workflow_file):
+        code, _ = self.api("POST", f"repos/{repo}/actions/workflows/{workflow_file}/dispatches",
+                           {"ref": branch})
+        return code == 204
+
+    def cancel_run(self, repo, run_id):
+        code, _ = self.api("POST", f"repos/{repo}/actions/runs/{run_id}/cancel")
+        return code == 202
+
+    # -- git trees (bulk create / delete / rename in one commit) ----------
+    def ref_head(self, repo, branch):
+        code, d = self.api("GET", f"repos/{repo}/git/ref/heads/{branch}")
+        return d["object"]["sha"] if code == 200 else None
+
+    def head_tree(self, repo, commit_sha):
+        code, d = self.api("GET", f"repos/{repo}/git/commits/{commit_sha}")
+        return d["tree"]["sha"] if code == 200 else None
+
+    def recursive_tree(self, repo, ref):
+        code, d = self.api("GET", f"repos/{repo}/git/trees/{ref}?recursive=1")
+        return d.get("tree", []) if code == 200 else []
+
+    def create_tree(self, repo, entries, base_tree=None):
+        body = {"tree": entries}
+        if base_tree:
+            body["base_tree"] = base_tree
+        code, d = self.api("POST", f"repos/{repo}/git/trees", body)
+        return d["sha"] if code in (200, 201) else None
+
+    def create_commit(self, repo, message, tree_sha, parents):
+        code, d = self.api("POST", f"repos/{repo}/git/commits",
+                           {"message": message, "tree": tree_sha, "parents": parents})
+        return d["sha"] if code in (200, 201) else None
+
+    def update_ref(self, repo, branch, sha):
+        code, _ = self.api("PATCH", f"repos/{repo}/git/refs/heads/{branch}", {"sha": sha})
+        return code == 200
+
+    def create_blob(self, repo, text):
+        code, d = self.api("POST", f"repos/{repo}/git/blobs",
+                           {"content": base64.b64encode(text.encode("utf-8")).decode(),
+                            "encoding": "base64"})
+        return d["sha"] if code in (200, 201) else None
+
+    def commit_tree_change(self, repo, branch, message, build_entries, log,
+                           attempts=5):
+        """Apply a tree change in ONE commit, retrying when the branch
+        moves underneath us. build_entries(tree_blobs) returns the
+        tree entries to apply on top of the current head (an entry
+        with sha=None deletes its path). Returns True when the commit
+        landed (or there was nothing to change)."""
+        for attempt in range(attempts):
+            head = self.ref_head(repo, branch)
+            if not head:
+                log("could not resolve the branch head")
+                return False
+            base = self.head_tree(repo, head)
+            blobs = [e for e in self.recursive_tree(repo, head)
+                     if e.get("type") == "blob"]
+            entries = build_entries(blobs)
+            if entries is None:
+                return False
+            if not entries:
                 return True
-        return name not in self._active_workflows()
+            tree_sha = self.create_tree(repo, entries, base_tree=base)
+            if not tree_sha:
+                log("creating the tree FAILED")
+                return False
+            commit = self.create_commit(repo, message, tree_sha, [head])
+            if not commit:
+                log("creating the commit FAILED")
+                return False
+            if self.update_ref(repo, branch, commit):
+                return True
+            log(f"branch moved during the commit (attempt "
+                f"{attempt + 1}/{attempts}) — retrying…")
+            time.sleep(2)
+        log("the change did not land — run it again")
+        return False
 
-    def _rebuild_servers(self, names):
-        """Rebuild the uptime rows from the loaded workflow names, so a
-        newly added instance appears (and a deleted one disappears)."""
-        urls = server_urls(names)
-        if urls == self.servers:
-            return
-        self.servers = urls
-        for child in self.srv_frame.winfo_children():
-            child.destroy()
-        self.srv_labels = {}
-        self.up_since = {u: t for u, t in self.up_since.items() if u in urls}
-        for url in urls:
-            row = ttk.Frame(self.srv_frame)
-            row.pack(fill="x")
-            link = tk.Label(row, text=url, width=22, fg="blue", cursor="hand2",
-                            font=("TkDefaultFont", 9, "underline"))
-            link.pack(side="left")
-            link.bind("<Button-1>", lambda e, u=url: webbrowser.open(u))
-            lbl = ttk.Label(row, text="… checking", foreground="gray")
-            lbl.pack(side="left", padx=8)
-            self.srv_labels[url] = lbl
-            ttk.Button(row, text="Connect", width=9,
-                       command=lambda u=url: self.connect_server(u)).pack(side="right", padx=2)
 
-    def add_instance(self):
-        if self._inst_busy:
-            self.log("Another instance operation is running — wait for it to finish.")
-            return
-        self._inst_busy = True
-        self.run_bg(self._add_instance_locked)
+# ---------------------------------------------------------------------------
+# Fleet operations (UI-independent; log is a callable taking a string)
+# ---------------------------------------------------------------------------
 
-    def _add_instance_locked(self):
+def active_run_for(gh, repo, branch, workflow_file):
+    """The active run dict of one workflow file on `branch`, or None."""
+    for r in gh.list_runs(repo):
+        if (r.get("path", "").endswith(workflow_file)
+                and r.get("status") in ACTIVE_STATUSES
+                and r.get("head_branch") == branch):
+            return r
+    return None
+
+
+def cancel_and_wait(gh, repo, branch, wf, workflow_file, log):
+    """Cancel the machine's active run and wait until it is really
+    over — a dying run's final sync writes state back, so file/data
+    operations must not race it. Bounded wait (30 x 4s polls, short
+    per-poll timeout): an unconfirmed stop aborts THIS machine's
+    operation instead of holding the app hostage. True when clear."""
+    run = active_run_for(gh, repo, branch, workflow_file)
+    if not run:
+        return True
+    log(f"{wf}: cancelling run {run['id']} and waiting…")
+    gh.cancel_run(repo, run["id"])
+    for _ in range(30):
+        time.sleep(4)
+        _, d = gh.api("GET", f"repos/{repo}/actions/runs/{run['id']}",
+                      timeout=15)
+        if d.get("status") == "completed":
+            return True
+    log(f"{wf}: run {run['id']} did not confirm stopped — this machine "
+        f"is SKIPPED (nothing of it was removed); retry once it ended")
+    return False
+
+
+def create_instances(gh, cfg, count, log):
+    """Clone `count` new instances from the repo's FIRST machine.
+
+    The template is the lowest-numbered instance's workflow file (or,
+    with no machine left, the most recently deleted one from git
+    history). Numbering gap-fills over workflow numbers ∪ state-dir
+    numbers. All new files land in ONE git-tree commit. Returns the
+    created instance names ([] when nothing was created).
+    """
+    repo, branch = cfg["repo"], cfg["branch"]
+    inst = gh.list_instances(repo, branch)
+    if inst:
+        template_name = sorted(
+            inst, key=lambda n: parse_instance_name(n)[1])[0]
+        template_text = inst[template_name]["text"]
+        log(f"template: first machine {template_name} "
+            f"({inst[template_name]['file']})")
+    else:
+        hist = gh.history_template(repo, branch)
+        if not hist:
+            log("no instance workflow found, and none in git history "
+                "either — nothing to clone from")
+            return []
+        template_name, template_text = hist
+        log(f"repo is empty — using the last deleted workflow "
+            f"({template_name}) from git history as the template")
+    prefix = parse_instance_name(template_name)[0]
+    used = {parse_instance_name(n)[1] for n in inst}
+    used |= gh.state_numbers(repo, branch)
+    numbers = plan_new_numbers(used, count)
+    names = [f"{prefix}{n}" for n in numbers]
+    texts = {}
+    for name in names:
         try:
-            self._add_instance()
-        finally:
-            self._inst_busy = False
-
-    def _add_instance(self):
-        repo = self.repo_var.get().strip()
-        branch = self.branch_var.get().strip() or "opc"
-        if not repo:
-            self.log("Add instance: set the repo in Settings first.")
-            return
-        inst = self._instance_files(repo, branch)
-        used = {parse_instance_name(n)[1] for n in inst}
-        # A number whose state dir survived a hand-deleted workflow must
-        # not be reused either — its old data would silently revive.
-        listing = self._api_json("GET", f"repos/{repo}/contents/opencode/instances?ref={branch}")
-        if isinstance(listing, list):
-            for e in listing:
-                p = parse_instance_name(e.get("name", ""))
-                if p:
-                    used.add(p[1])
-        new_num = next_free_number(used)
-        if inst:
-            template_name, template_file = sorted(
-                inst.items(), key=lambda kv: parse_instance_name(kv[0])[1])[0]
-            prefix = parse_instance_name(template_name)[0]
-            tpl = self._api_json("GET", f"repos/{repo}/contents/.github/workflows/{template_file}?ref={branch}")
-            if not tpl or "content" not in tpl:
-                self.log(f"Add instance: could not read template {template_file}.")
-                return
-            try:
-                template_text = base64.b64decode(tpl["content"]).decode("utf-8")
-            except Exception:
-                self.log(f"Add instance: could not decode template {template_file}.")
-                return
-        else:
-            # Zero instances left: recover the most recently deleted
-            # workflow from git history and use it as the template, so
-            # the fleet can always be rebuilt from inside the app.
-            hist = self._history_template(repo, branch)
-            if not hist:
-                self.log("Add instance: no instance workflow found, and none in git history either.")
-                return
-            prefix = parse_instance_name(hist[0])[0]
-            template_text = hist[1]
-            self.log(f"Add instance: repo is empty — using the last deleted workflow "
-                     f"({hist[0]}) from git history as the template.")
-        new_name = f"{prefix}{new_num}"
-        try:
-            new_text = renamed_workflow(template_text, new_name)
+            texts[name] = renamed_workflow(template_text, name)
         except ValueError as e:
-            self.log(f"Add instance: {e}")
-            return
-        new_file = f"{new_name}.yml"
-        body = {"message": f"Add {new_name} workflow",
-                "content": base64.b64encode(new_text.encode("utf-8")).decode(),
-                "branch": branch}
-        rc, _ = self._gh_api("PUT", f"repos/{repo}/contents/.github/workflows/{new_file}", body)
-        if rc != 0:
-            self.log(f"Add instance: creating {new_file} failed.")
-            return
-        self.log(f"✅ Created .github/workflows/{new_file} — {new_name} starts with a "
-                 f"clean state and creates opencode/instances/{new_name}/ on its first sync.")
-        self.after(3000, self.reload_workflows)
+            log(f"create aborted: {e}")
+            return []
+    # One blob per new file, created in parallel.
+    blob_sha = {}
 
-    def delete_instance(self):
-        if self._inst_busy:
-            self.log("Another instance operation is running — wait for it to finish.")
+    def make_blob(name):
+        blob_sha[name] = gh.create_blob(repo, texts[name])
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        list(ex.map(make_blob, names))
+    if any(not s for s in blob_sha.values()):
+        log("create aborted: a blob upload FAILED (nothing committed)")
+        return []
+
+    def entries(_blobs):
+        return [{"path": f".github/workflows/{name}.yml", "mode": "100644",
+                 "type": "blob", "sha": blob_sha[name]} for name in names]
+
+    msg = (f"Add {names[0]} workflow" if count == 1 else
+           f"Add {count} instances from {template_name}: "
+           f"{names[0]}..{names[-1]}")
+    if not gh.commit_tree_change(repo, branch, msg, entries, log):
+        log("create FAILED — no instances were committed")
+        return []
+    for name in names:
+        log(f"✅ Created .github/workflows/{name}.yml — {name} starts "
+            f"with a clean state and creates opencode/instances/"
+            f"{name}/ on its first sync")
+    return names
+
+
+def delete_instances(gh, cfg, names, log):
+    """Delete the given machines of one repo, completely.
+
+    Every machine's active run is cancelled and awaited first; a
+    machine whose run will not confirm stopped is skipped untouched.
+    The rest go in ONE git-tree commit: their workflow files plus
+    ALL blobs under opencode/instances/<name>/ each. The shared
+    opencode/config is never touched. Returns (deleted, skipped).
+    """
+    repo, branch = cfg["repo"], cfg["branch"]
+    inst = gh.list_instances(repo, branch)
+    cleared = []
+    skipped = []
+    for name in names:
+        info = inst.get(name)
+        if info and not cancel_and_wait(gh, repo, branch, name,
+                                        info["file"], log):
+            skipped.append(name)
+        else:
+            cleared.append(name)
+    if not cleared:
+        return [], skipped
+    prefixes = tuple(f"opencode/instances/{n}/" for n in cleared)
+    files = {inst[n]["file"] for n in cleared if n in inst}
+
+    def entries(blobs):
+        out = [{"path": f".github/workflows/{f}", "mode": "100644",
+                "type": "blob", "sha": None} for f in sorted(files)]
+        out += [{"path": e["path"], "mode": "100644", "type": "blob",
+                 "sha": None} for e in blobs
+                if e["path"].startswith(prefixes)]
+        return out
+
+    msg = (f"Remove {cleared[0]} instance (workflow + data)"
+           if len(cleared) == 1 else
+           f"Remove {len(cleared)} instances (workflows + data): "
+           f"{', '.join(cleared)}")
+    if not gh.commit_tree_change(repo, branch, msg, entries, log):
+        log("delete FAILED — the commit did not land")
+        return [], skipped + cleared
+    for name in cleared:
+        log(f"✅ {name} deleted (workflow file + "
+            f"opencode/instances/{name}/)")
+    log("Shared opencode/config untouched.")
+    return cleared, skipped
+
+
+def rename_prefix_op(gh, cfg, old_prefix, new_prefix, log):
+    """Rename the instance prefix of one repo in ONE commit: new
+    workflow files are added, old ones deleted, and each instance's
+    state blobs move opencode/instances/<old>N/ -> <new>N/. Active
+    runs are cancelled and awaited first. h-dashboard branches and
+    old Tailscale entries are NOT renamed. Returns True on success."""
+    repo, branch = cfg["repo"], cfg["branch"]
+    inst = gh.list_instances(repo, branch)
+    targets = {}
+    for name in inst:
+        p = parse_instance_name(name)
+        if p and p[0] == old_prefix:
+            targets[name] = f"{new_prefix}{p[1]}"
+    if not targets:
+        log(f"no {old_prefix}N instances found in {repo}")
+        return False
+    for old_name in targets:
+        if not cancel_and_wait(gh, repo, branch, old_name,
+                               inst[old_name]["file"], log):
+            log(f"rename aborted: {old_name} is still running "
+                f"(nothing changed)")
+            return False
+    blob_sha = {}
+
+    def make_blob(item):
+        old_name, new_name = item
+        try:
+            text = renamed_workflow(inst[old_name]["text"], new_name)
+        except ValueError:
+            blob_sha[old_name] = None
             return
-        names = self._wf_names(True)
-        if not names:
+        blob_sha[old_name] = gh.create_blob(repo, text)
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        list(ex.map(make_blob, sorted(targets.items())))
+    if any(not s for s in blob_sha.values()):
+        log("rename aborted: a renamed workflow could not be prepared "
+            "(nothing changed)")
+        return False
+    moves = [(f"opencode/instances/{o}/", f"opencode/instances/{n}/")
+             for o, n in sorted(targets.items())]
+
+    def entries(blobs):
+        out = []
+        for old_name, new_name in sorted(targets.items()):
+            out.append({"path": f".github/workflows/{new_name}.yml",
+                        "mode": "100644", "type": "blob",
+                        "sha": blob_sha[old_name]})
+            old_file = inst[old_name]["file"]
+            if old_file != f"{new_name}.yml":
+                out.append({"path": f".github/workflows/{old_file}",
+                            "mode": "100644", "type": "blob", "sha": None})
+        for e in blobs:
+            for old_dir, new_dir in moves:
+                if e["path"].startswith(old_dir):
+                    out.append({"path": new_dir + e["path"][len(old_dir):],
+                                "mode": e["mode"], "type": "blob",
+                                "sha": e["sha"]})
+                    out.append({"path": e["path"], "mode": "100644",
+                                "type": "blob", "sha": None})
+                    break
+        return out
+
+    if not gh.commit_tree_change(
+            repo, branch,
+            f"Rename instance prefix {old_prefix} -> {new_prefix}",
+            entries, log):
+        log("rename FAILED — the commit did not land")
+        return False
+    log(f"✅ Prefix renamed {old_prefix} -> {new_prefix} "
+        f"({len(targets)} instance(s), one commit)")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        root.title("Remote-Op — OpenCode fleet manager")
+        root.geometry("1360x780")
+        self.settings = load_settings()
+        self.instances = {}   # (label, wf) -> workflow info, ALL repos
+        self.runs = {}        # (label, wf) -> latest run dict
+        self.uptime = {}      # (label, wf) -> (up: bool, since: ts|None)
+        self._loading = set()  # repo labels whose refresh is in flight
+        self.checked = set()   # (label, wf) ticked in the fleet tree
+        self._op_lock = threading.Lock()
+        self._op_desc = None
+
+        # ---- theme ---------------------------------------------------
+        # Same light theme as RemoteHermes, on ttk's clam base (pure
+        # stdlib): soft gray app background, white cards, one accent
+        # for primary actions, Segoe UI text, Consolas for the log.
+        BG, PANEL = "#f3f4f6", "#ffffff"
+        INK, MUTED, ACCENT = "#111827", "#6b7280", "#2563eb"
+        self.BG, self.MUTED = BG, MUTED
+        root.configure(bg=BG)
+        root.option_add("*Font", ("Segoe UI", 10))
+        root.minsize(1080, 620)
+        style = ttk.Style(root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure(".", font=("Segoe UI", 10), background=BG,
+                        foreground=INK)
+        style.configure("TButton", padding=(10, 5), background="#e8ebef",
+                        bordercolor="#d1d5db")
+        style.map("TButton",
+                  background=[("active", "#d9dee6"),
+                              ("disabled", "#eef0f3")])
+        style.configure("Accent.TButton", background=ACCENT,
+                        foreground="#ffffff", bordercolor=ACCENT)
+        style.map("Accent.TButton",
+                  background=[("active", "#1d4ed8"),
+                              ("disabled", "#93c5fd")],
+                  foreground=[("disabled", "#ffffff")])
+        style.configure("Danger.TButton", foreground="#b91c1c")
+        style.configure("Treeview", background=PANEL,
+                        fieldbackground=PANEL, rowheight=26, borderwidth=0)
+        style.configure("Treeview.Heading", background="#eef2f7",
+                        font=("Segoe UI", 10, "bold"), relief="flat")
+        style.map("Treeview", background=[("selected", "#dbeafe")],
+                  foreground=[("selected", INK)])
+        style.configure("TCombobox", padding=4)
+
+        def section(parent, text):
+            tk.Label(parent, text=text, bg=BG, fg=MUTED,
+                     font=("Segoe UI", 9, "bold")).pack(
+                         anchor="w", padx=12, pady=(12, 4))
+
+        top = tk.Frame(root, bg=BG)
+        top.pack(fill=tk.X, padx=12, pady=(10, 2))
+        tk.Label(top, text="Target repo:", bg=BG).pack(side=tk.LEFT)
+        self.repo_var = tk.StringVar()
+        self.repo_combo = ttk.Combobox(top, textvariable=self.repo_var,
+                                       state="readonly", width=22)
+        self.repo_combo.pack(side=tk.LEFT, padx=6)
+        self.repo_combo.bind("<<ComboboxSelected>>", self._on_repo_switch)
+        ttk.Button(top, text="Repos…", command=self._repos_dialog).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="↻ Refresh", command=self.refresh).pack(side=tk.LEFT, padx=2)
+        self.status_var = tk.StringVar(value="")
+        tk.Label(top, textvariable=self.status_var, bg=BG,
+                 fg=MUTED).pack(side=tk.LEFT, padx=12)
+
+        # Two panes below the header: fleet list + controls on the
+        # LEFT (full height), log on the RIGHT. Draggable divider.
+        body = tk.PanedWindow(root, orient=tk.HORIZONTAL, sashwidth=4,
+                              bg="#d1d5db", bd=0)
+        body.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        left = tk.Frame(body, bg=BG)
+        right = tk.Frame(body, bg=BG)
+        body.add(left, minsize=470, stretch="always")
+        body.add(right, minsize=330, stretch="always")
+        root.after(80, lambda: body.sash_place(0, 830, 0))
+
+        section(left, "MACHINES")
+        bar = tk.Frame(left, bg=BG)
+        bar.pack(fill=tk.X, padx=12, pady=(0, 8))
+        ttk.Button(bar, text="▶ Run checked", style="Accent.TButton", command=self.run_checked).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text="⏹ Stop checked", style="Danger.TButton", command=self.stop_checked).pack(side=tk.LEFT, padx=2)
+        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        ttk.Button(bar, text="▶▶ Run all", command=self.run_all).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text="⏹ Stop all", command=self.cancel_all).pack(side=tk.LEFT, padx=2)
+
+        tree_card = tk.Frame(left, bg=PANEL, highlightbackground="#e5e7eb",
+                             highlightthickness=1)
+        tree_card.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
+        # One tree for the whole fleet: a group row per repo (its
+        # label in the tree column), its machines as child rows.
+        cols = ("file", "run", "started", "remaining", "server")
+        self.tree = ttk.Treeview(tree_card, columns=cols,
+                                 show="tree headings", height=14)
+        self.tree.heading("#0", text="Repo / Machine")
+        self.tree.column("#0", width=135)
+        for col, title, w in [("file", "File", 195),
+                              ("run", "Run", 95), ("started", "Started", 58),
+                              ("remaining", "Remaining", 82),
+                              ("server", "Server", 105)]:
+            self.tree.heading(col, text=title)
+            self.tree.column(col, width=w)
+        self.tree.tag_configure("low", foreground="#c0392b")
+        self.tree.tag_configure("ok", foreground="#1e8449")
+        self.tree.tag_configure("down", foreground="#c0392b")
+        self.tree.tag_configure("acct", background="#e8eef5",
+                                font=("Segoe UI", 10, "bold"))
+        self.tree.tag_configure("even", background="#ffffff")
+        self.tree.tag_configure("odd", background="#f8fafc")
+        vsb = ttk.Scrollbar(tree_card, orient=tk.VERTICAL,
+                            command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.img_off = self._box_image(0)
+        self.img_on = self._box_image(1)
+        self.img_some = self._box_image(2)
+        self.tree.bind("<Button-1>", self._on_tree_click, add="+")
+        self.tree.bind("<space>", self._on_tree_space, add="+")
+        self.tree.bind("<Double-1>", self._on_tree_double, add="+")
+
+        btns = tk.Frame(left, bg=BG)
+        btns.pack(fill=tk.X, padx=12, pady=(2, 2))
+        self.btn_add = ttk.Button(btns, text="Add instance…", command=self.add_instance)
+        self.btn_add.pack(side=tk.LEFT, padx=2)
+        self.btn_bulk = ttk.Button(btns, text="Create N from first…", style="Accent.TButton", command=self.create_bulk)
+        self.btn_bulk.pack(side=tk.LEFT, padx=2)
+        self.btn_del = ttk.Button(btns, text="Delete checked", style="Danger.TButton", command=self.delete_checked)
+        self.btn_del.pack(side=tk.LEFT, padx=2)
+        ttk.Separator(btns, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        self.select_all_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(btns, text="Select all", variable=self.select_all_var,
+                        command=self._toggle_select_all).pack(side=tk.LEFT, padx=2)
+        self.checked_var = tk.StringVar(value="")
+        tk.Label(btns, textvariable=self.checked_var, bg=BG,
+                 fg=MUTED).pack(side=tk.LEFT, padx=6)
+
+        util = tk.Frame(left, bg=BG)
+        util.pack(fill=tk.X, padx=12, pady=2)
+        self.btn_rename = ttk.Button(util, text="Rename prefix…", command=self.rename_prefix)
+        self.btn_rename.pack(side=tk.LEFT, padx=2)
+        ttk.Button(util, text="Connect", command=self.connect_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(util, text="🧹 Delete old runs", command=self.delete_old_runs).pack(side=tk.LEFT, padx=2)
+        self.hide_cancelled_var = tk.BooleanVar(
+            value=bool(self.settings.get("hide_cancelled")))
+        ttk.Checkbutton(util, text="Hide cancelled",
+                        variable=self.hide_cancelled_var,
+                        command=self._toggle_hide_cancelled).pack(side=tk.LEFT, padx=6)
+        self.uptime_var = tk.StringVar(value="server check: —")
+        tk.Label(util, textvariable=self.uptime_var, bg=BG,
+                 fg=MUTED).pack(side=tk.LEFT, padx=6)
+
+        section(right, "LOG")
+        self.op_var = tk.StringVar(value="")
+        self.op_label = tk.Label(right, textvariable=self.op_var, anchor="w",
+                                 bg="#eef2f7", fg=INK,
+                                 font=("Segoe UI", 10, "bold"))
+        self.op_label.pack(fill=tk.X, padx=12, pady=(0, 6), ipady=5)
+        self.logbox = scrolledtext.ScrolledText(
+            right, height=14, state="normal", bg=PANEL,
+            font=("Consolas", 9), relief="flat", wrap=tk.WORD,
+            highlightbackground="#e5e7eb", highlightthickness=1)
+        self.logbox.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 10))
+        self.logbox.tag_configure("err", foreground="#b91c1c")
+        self.logbox.tag_configure("ok", foreground="#15803d")
+        self.logbox.tag_configure("warn", foreground="#b45309")
+        self._sync_repo_combo()
+        self._apply_active_password()
+        if self.settings["repos"]:
+            self.refresh()
+        else:
+            self.log("No repos yet — open Repos… and add one "
+                     "(label, repo owner/name, branch; PAT optional — "
+                     "empty uses your gh CLI login). An old-format "
+                     "settings.json is migrated automatically.")
+        self.root.after(60 * 1000, self._uptime_loop)
+
+    # -- plumbing -----------------------------------------------------------
+    def log(self, msg):
+        self.root.after(0, self._log_now, str(msg))
+
+    def _log_now(self, msg):
+        tag = None
+        if "ERROR" in msg or "FAILED" in msg or "ABORTED" in msg \
+                or " aborted" in msg:
+            tag = "err"
+        elif msg.startswith("✅"):
+            tag = "ok"
+        elif msg.startswith("⏳") or "still in progress" in msg \
+                or "retrying" in msg:
+            tag = "warn"
+        self.logbox.insert(tk.END, msg + "\n", tag)
+        self.logbox.see(tk.END)
+
+    def bg(self, fn):
+        threading.Thread(target=self._guarded, args=(fn,), daemon=True).start()
+
+    def _guarded(self, fn):
+        try:
+            fn()
+        except Exception as e:
+            self.log(f"ERROR: {e}")
+
+    def _acquire_op(self, what):
+        """Serialize Add/Create/Delete/Rename behind one lock; name
+        the holder so a refusal says WHAT is still running instead of
+        a bare 'wait'."""
+        if not self._op_lock.acquire(blocking=False):
+            self.log(f"{self._op_desc or 'another operation'} still in "
+                     f"progress — wait for it")
+            return False
+        self._op_desc = what
+        self._op_started(what)
+        return True
+
+    def _release_op(self):
+        self._op_desc = None
+        self._op_lock.release()
+
+    def _op_started(self, what):
+        """Persistent operation indicator (above the log): the user
+        must be able to SEE that work is running — log lines alone
+        scroll past. The mutating buttons lock while an op runs."""
+        def ui():
+            self.op_var.set(f"⏳ {what} — running…")
+            self.op_label.config(fg="#92400e", bg="#fef3c7")
+            for b in (self.btn_add, self.btn_bulk, self.btn_del,
+                      self.btn_rename):
+                b.state(["disabled"])
+        self.root.after(0, ui)
+
+    def _op_done(self, text, ok=True):
+        def ui():
+            self.op_var.set(("✅ " if ok else "⚠️ ") + text)
+            self.op_label.config(fg="#166534" if ok else "#991b1b",
+                                 bg="#dcfce7" if ok else "#fee2e2")
+            for b in (self.btn_add, self.btn_bulk, self.btn_del,
+                      self.btn_rename):
+                b.state(["!disabled"])
+        self.root.after(0, ui)
+
+    # -- repo bookkeeping -----------------------------------------------------
+    def target_repo(self):
+        label = self.repo_var.get()
+        for a in self.settings["repos"]:
+            if a["label"] == label:
+                return a
+        return self.settings["repos"][0] if self.settings["repos"] else None
+
+    def _sync_repo_combo(self):
+        labels = [a["label"] for a in self.settings["repos"]]
+        self.repo_combo["values"] = labels
+        active = self.settings.get("active")
+        if active in labels:
+            self.repo_var.set(active)
+        elif labels:
+            self.repo_var.set(labels[0])
+
+    def _on_repo_switch(self, _evt=None):
+        self.settings["active"] = self.repo_var.get()
+        try:
+            save_settings(self.settings)
+        except OSError as e:
+            messagebox.showerror(
+                "Remote-Op",
+                f"Could not save settings:\n{SETTINGS_PATH}\n\n{e}")
+        self._apply_active_password()
+        self._fill_tree()
+
+    def repo_by_label(self, label):
+        for a in self.settings["repos"]:
+            if a["label"] == label:
+                return a
+        return None
+
+    def instances_of(self, label):
+        return {wf: info for (lb, wf), info in self.instances.items()
+                if lb == label}
+
+    def _apply_active_password(self):
+        """Export the target repo's OpenCode server password for this
+        session (OPENCODE_SERVER_PASSWORD is what the V2 client reads;
+        OPENCODE_PASSWORD is kept alongside for legacy tooling)."""
+        cfg = self.target_repo()
+        pwd = cfg["password"] if cfg else ""
+        os.environ["OPENCODE_PASSWORD"] = pwd
+        os.environ["OPENCODE_SERVER_PASSWORD"] = pwd
+
+    def selected_ref(self):
+        """(repo_cfg, wf) for a machine row, (repo_cfg, None) for a
+        repo group row, None when nothing usable is selected."""
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        iid = sel[0]
+        if iid.startswith("i::"):
+            label, wf = iid[3:].rsplit("::", 1)
+            cfg = self.repo_by_label(label)
+            return (cfg, wf) if cfg else None
+        if iid.startswith("a::"):
+            cfg = self.repo_by_label(iid[3:])
+            return (cfg, None) if cfg else None
+        return None
+
+    def scope_repo(self):
+        """The repo the per-repo actions apply to: the selected row's
+        repo, else the target repo (top combo)."""
+        ref = self.selected_ref()
+        return ref[0] if ref else self.target_repo()
+
+    # -- refresh --------------------------------------------------------------
+    def refresh(self):
+        repos = list(self.settings["repos"])
+        if not repos:
             return
-        name = names[0]
-        if not parse_instance_name(name):
-            messagebox.showwarning("Delete instance",
-                                   f"{name} is not an instance name (<prefix><number>).")
+        self.status_var.set("loading…")
+        # Progressive: every repo's group row appears at once (marked
+        # loading), and its machines land the moment THAT repo's fetch
+        # finishes — not after the slowest repo.
+        self._loading = {a["label"] for a in repos}
+        self._fill_tree()
+
+        def work():
+            def fetch(cfg):
+                label = cfg["label"]
+                inst = runs = None
+                try:
+                    gh = GH(cfg["pat"])
+                    inst = gh.list_instances(cfg["repo"], cfg["branch"])
+                    runs = {}
+                    for r in gh.list_runs(cfg["repo"]):
+                        wf = None
+                        for name, info in inst.items():
+                            if r.get("path", "").endswith(info["file"]):
+                                wf = name
+                                break
+                        if wf and (label, wf) not in runs:
+                            runs[(label, wf)] = r
+                except Exception as e:
+                    self.log(f"{label}: load FAILED ({e})")
+
+                def apply(cfg=cfg, inst=inst, runs=runs):
+                    label = cfg["label"]
+                    if inst is not None:
+                        for k in [k for k in self.instances if k[0] == label]:
+                            del self.instances[k]
+                        for k in [k for k in self.runs if k[0] == label]:
+                            del self.runs[k]
+                        for k in [k for k in self.uptime if k[0] == label]:
+                            del self.uptime[k]
+                        for wf, info in inst.items():
+                            self.instances[(label, wf)] = info
+                        self.runs.update(runs)
+                    self._loading.discard(label)
+                    self._fill_tree()
+
+                self.root.after(0, apply)
+
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                list(ex.map(fetch, repos))
+
+        self.bg(work)
+
+    def _toggle_hide_cancelled(self):
+        self.settings["hide_cancelled"] = bool(self.hide_cancelled_var.get())
+        try:
+            save_settings(self.settings)
+        except OSError as e:
+            self.log(f"could not save settings: {e}")
+        self._fill_tree()
+
+    @staticmethod
+    def _box_image(kind):
+        """A tiny checkbox image: 0 = empty, 1 = ticked, 2 = partial."""
+        img = tk.PhotoImage(width=13, height=13)
+        img.put("#ffffff", to=(0, 0, 13, 13))
+        for i in range(13):
+            img.put("#666666", to=(i, 0, i + 1, 1))
+            img.put("#666666", to=(i, 12, i + 1, 13))
+            img.put("#666666", to=(0, i, 1, i + 1))
+            img.put("#666666", to=(12, i, 13, i + 1))
+        if kind == 1:
+            for x, y in [(2, 6), (3, 7), (4, 8), (5, 9), (5, 10), (6, 7),
+                         (6, 8), (7, 5), (8, 4), (9, 3), (10, 2), (10, 3)]:
+                img.put("#1a7f37", to=(x, y, x + 1, y + 1))
+        elif kind == 2:
+            img.put("#1a7f37", to=(3, 3, 10, 10))
+        return img
+
+    def _repo_check_state(self, label):
+        wfs = [wf for (l, wf) in self.instances if l == label]
+        if not wfs:
+            return 0
+        n = sum(1 for wf in wfs if (label, wf) in self.checked)
+        return 1 if n == len(wfs) else (2 if n else 0)
+
+    def _server_text(self, label, wf):
+        st = self.uptime.get((label, wf))
+        if st is None:
+            return "—"
+        up, since = st
+        if not up:
+            return "● DOWN"
+        if since:
+            mins = int((time.time() - since) // 60)
+            h, m = divmod(mins, 60)
+            return f"● UP {h}h{m:02d}m" if h else f"● UP {m}m"
+        return "● UP"
+
+    def _fill_tree(self):
+        self.tree.delete(*self.tree.get_children())
+        self.checked.intersection_update(self.instances.keys())
+        total, running, hidden = 0, 0, 0
+        for cfg in self.settings["repos"]:
+            label = cfg["label"]
+            inst = self.instances_of(label)
+            parent = self.tree.insert(
+                "", tk.END, iid=f"a::{label}",
+                text=" " + label + (" (loading…)" if label in self._loading else ""),
+                image=(self.img_off, self.img_on, self.img_some)[
+                    self._repo_check_state(label)],
+                open=True,
+                values=(cfg["repo"], "", "", "", ""), tags=("acct",))
+            for rowno, wf in enumerate(sorted(
+                    inst, key=lambda n: parse_instance_name(n)[1])):
+                info = inst[wf]
+                run = self.runs.get((label, wf), {})
+                status = run.get("status") or "—"
+                if (self.settings.get("hide_cancelled")
+                        and status not in ("in_progress", "queued")
+                        and run.get("conclusion") == "cancelled"):
+                    hidden += 1
+                    continue
+                shown = status if status != "completed" else (run.get("conclusion") or "completed")
+                started, remaining, tag = "—", "—", ""
+                if run.get("created_at"):
+                    started = datetime.fromisoformat(
+                        run["created_at"].replace("Z", "+00:00")).astimezone().strftime("%H:%M")
+                if status in ("in_progress", "queued"):
+                    running += 1
+                    mins = remaining_minutes(run.get("created_at"), info["timeout"])
+                    remaining = fmt_remaining(mins)
+                    tag = "low" if (mins is not None and mins < 120) else "ok"
+                srv = self._server_text(label, wf)
+                # One row colour only (ttk tags are per-row): a DOWN
+                # server outranks the green "plenty of budget" tint,
+                # but never the red low-budget warning.
+                row_tag = tag
+                if srv.startswith("● DOWN") and row_tag != "low":
+                    row_tag = "down"
+                self.tree.insert(
+                    parent, tk.END, iid=f"i::{label}::{wf}",
+                    text=f" {wf}",
+                    image=self.img_on if (label, wf) in self.checked
+                    else self.img_off,
+                    values=(info["file"], shown, started, remaining, srv),
+                    tags=tuple(t for t in (row_tag,
+                                           "odd" if rowno % 2 else "even") if t))
+                total += 1
+        self.status_var.set(f"{len(self.settings['repos'])} repo(s), "
+                            f"{total} machine(s), {running} running"
+                            + (f", {hidden} cancelled hidden" if hidden else "")
+                            + (f" — loading {len(self._loading)} repo(s)…"
+                               if self._loading else ""))
+        self.checked_var.set(f"{len(self.checked)} checked"
+                             if self.checked else "")
+        self.select_all_var.set(bool(self.instances) and
+                                len(self.checked) == len(self.instances))
+
+    # -- checkbox handling ------------------------------------------------------
+    @staticmethod
+    def _parse_iid(iid):
+        if iid.startswith("i::"):
+            label, wf = iid[3:].rsplit("::", 1)
+            return ("i", label, wf)
+        if iid.startswith("a::"):
+            return ("a", iid[3:], None)
+        return (None, None, None)
+
+    def _toggle_instance(self, label, wf):
+        key = (label, wf)
+        if key in self.checked:
+            self.checked.discard(key)
+        else:
+            self.checked.add(key)
+        self._fill_tree()
+
+    def _toggle_repo(self, label):
+        wfs = [wf for (l, wf) in self.instances if l == label]
+        if all((label, wf) in self.checked for wf in wfs) and wfs:
+            for wf in wfs:
+                self.checked.discard((label, wf))
+        else:
+            for wf in wfs:
+                self.checked.add((label, wf))
+        self._fill_tree()
+
+    def _on_tree_click(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        # Only the checkbox image / first column toggles; a click
+        # elsewhere just selects the row.
+        col = self.tree.identify_column(event.x)
+        if col != "#0":
+            return
+        kind, label, wf = self._parse_iid(iid)
+        if kind == "i":
+            self._toggle_instance(label, wf)
+        elif kind == "a":
+            self._toggle_repo(label)
+
+    def _on_tree_space(self, _event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return "break"
+        kind, label, wf = self._parse_iid(sel[0])
+        if kind == "i":
+            self._toggle_instance(label, wf)
+        elif kind == "a":
+            self._toggle_repo(label)
+        return "break"
+
+    def _on_tree_double(self, _event=None):
+        ref = self.selected_ref()
+        if ref and ref[1]:
+            webbrowser.open(f"http://{ref[1]}:4096")
+
+    def _toggle_select_all(self):
+        if self.select_all_var.get():
+            self.checked = set(self.instances.keys())
+        else:
+            self.checked = set()
+        self._fill_tree()
+
+    # -- uptime (every 5 min, integrated in the Server column) -----------------
+    def _uptime_loop(self):
+        self.bg(self._check_uptime)
+        self.root.after(5 * 60 * 1000, self._uptime_loop)
+
+    @staticmethod
+    def _ping(url, timeout=6):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as r:
+                return r.status < 500
+        except Exception:
+            return False
+
+    def _check_uptime(self):
+        keys = list(self.instances.keys())
+
+        def probe(key):
+            label, wf = key
+            ok = self._ping(f"http://{wf}:4096")
+            prev = self.uptime.get(key)
+            since = prev[1] if (prev and prev[0] and ok) else (
+                time.time() if ok else None)
+            self.uptime[key] = (ok, since)
+
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(probe, keys))
+        self.root.after(0, self._after_uptime)
+
+    def _after_uptime(self):
+        self.uptime_var.set(
+            f"server check: {time.strftime('%H:%M:%S')} (every 5 min)")
+        self._fill_tree()
+
+    # -- run / cancel -----------------------------------------------------------
+    def _dispatch(self, cfg, wf):
+        info = self.instances.get((cfg["label"], wf))
+        if not info:
+            return
+        run = self.runs.get((cfg["label"], wf), {})
+        if run.get("status") in ("in_progress", "queued"):
+            self.log(f"{cfg['label']}/{wf}: already {run['status']} — skipped")
+            return
+        if GH(cfg["pat"]).dispatch(cfg["repo"], cfg["branch"], info["file"]):
+            self.log(f"{cfg['label']}/{wf}: dispatched")
+        else:
+            self.log(f"{cfg['label']}/{wf}: dispatch FAILED")
+
+    def _dispatch_many(self, targets):
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            list(ex.map(lambda t: self._dispatch(*t), targets))
+        self.refresh()
+
+    def run_checked(self):
+        targets = []
+        for label, wf in sorted(self.checked):
+            cfg = self.repo_by_label(label)
+            if cfg:
+                targets.append((cfg, wf))
+        if not targets:
+            self.log("nothing checked — tick the machines to run first")
+            return
+
+        def work():
+            self._dispatch_many(targets)
+        self.bg(work)
+
+    def run_all(self):
+        cfg = self.scope_repo()
+        if not cfg:
+            return
+        targets = [(cfg, wf) for wf in self.instances_of(cfg["label"])]
+        if not targets:
+            self.log(f"{cfg['label']}: no machines loaded")
+            return
+
+        def work():
+            self._dispatch_many(targets)
+        self.bg(work)
+
+    def _active_jobs(self, cfgs):
+        """[(cfg, wf, run_id)] for every active run of the given repos."""
+        jobs = []
+        for cfg in cfgs:
+            gh = GH(cfg["pat"])
+            inst = self.instances_of(cfg["label"])
+            for r in gh.list_runs(cfg["repo"]):
+                if r.get("status") not in ACTIVE_STATUSES:
+                    continue
+                for wf, info in inst.items():
+                    if r.get("path", "").endswith(info["file"]):
+                        jobs.append((cfg, wf, r["id"]))
+                        break
+        return jobs
+
+    def _cancel_many(self, jobs):
+        def one(job):
+            cfg, wf, rid = job
+            if GH(cfg["pat"]).cancel_run(cfg["repo"], rid):
+                self.log(f"{cfg['label']}/{wf}: run {rid} cancelled")
+            else:
+                self.log(f"{cfg['label']}/{wf}: cancel of run {rid} FAILED")
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            list(ex.map(one, jobs))
+        self.refresh()
+
+    def stop_checked(self):
+        cfgs = []
+        seen = set()
+        for label, _wf in sorted(self.checked):
+            if label not in seen:
+                seen.add(label)
+                cfg = self.repo_by_label(label)
+                if cfg:
+                    cfgs.append(cfg)
+        if not cfgs:
+            self.log("nothing checked — tick the machines to stop first")
+            return
+        checked = set(self.checked)
+
+        def work():
+            jobs = [j for j in self._active_jobs(cfgs)
+                    if (j[0]["label"], j[1]) in checked]
+            if not jobs:
+                self.log("no active runs among the checked machines")
+                return
+            self._cancel_many(jobs)
+        self.bg(work)
+
+    def cancel_all(self):
+        cfg = self.scope_repo()
+        if not cfg:
             return
         if not messagebox.askyesno(
-                "Delete instance",
-                f"Delete {name} completely?\n\n"
-                f"• its workflow file in .github/workflows/\n"
-                f"• ALL its data under opencode/instances/{name}/ "
-                f"(sessions, caches, 9router db)\n\n"
-                f"The shared opencode/config (skills etc.) is NOT touched.\n"
-                f"If {name} has an active run, it will be cancelled first."):
+                "Stop all",
+                f"Cancel every active run in {cfg['repo']}?"):
             return
-        self._inst_busy = True
-        self.run_bg(self._delete_instance_locked, name)
 
-    def _delete_instance_locked(self, name):
+        def work():
+            jobs = self._active_jobs([cfg])
+            if not jobs:
+                self.log(f"{cfg['label']}: no active runs")
+                return
+            self._cancel_many(jobs)
+        self.bg(work)
+
+    # -- connect ------------------------------------------------------------------
+    def connect_selected(self):
+        ref = self.selected_ref()
+        if not ref or not ref[1]:
+            self.log("select a machine first, then Connect")
+            return
+        cfg, wf = ref
+        url = f"http://{wf}:4096"
+        pwd = cfg["password"].replace("'", "''")
+        ps_cmd = (f"$env:OPENCODE_SERVER_PASSWORD='{pwd}'; "
+                  f"$env:OPENCODE_PASSWORD='{pwd}'; opencode --server {url}")
+        self.log(f"opencode --server {url} "
+                 f"(password via $env:OPENCODE_SERVER_PASSWORD, repo {cfg['label']})")
         try:
-            self._delete_instance(name)
-        finally:
-            self._inst_busy = False
-
-    def _delete_instance(self, name):
-        repo = self.repo_var.get().strip()
-        branch = self.branch_var.get().strip() or "opc"
-        if not repo:
-            self.log("Delete instance: set the repo in Settings first.")
-            return
-        # 1. Stop an active run first: its final sync-back would
-        #    resurrect the data deleted below.
-        if not self._cancel_and_wait(name):
-            self.log(f"Delete aborted: {name} is still running.")
-            return
-        # 2. Delete the workflow file (looked up by its WF_NAME).
-        fname = self._instance_files(repo, branch).get(name)
-        if fname:
-            meta = self._api_json("GET", f"repos/{repo}/contents/.github/workflows/{fname}?ref={branch}")
-            if meta and meta.get("sha"):
-                rc, _ = self._gh_api("DELETE", f"repos/{repo}/contents/.github/workflows/{fname}",
-                                     {"message": f"Remove {name} workflow",
-                                      "sha": meta["sha"], "branch": branch})
-                if rc != 0:
-                    self.log(f"Delete: removing {fname} failed — aborting before the data delete.")
-                    return
-                self.log(f"✅ Deleted .github/workflows/{fname}")
+            if os.name == "nt":
+                subprocess.Popen(
+                    ["powershell.exe", "-NoExit", "-Command", ps_cmd],
+                    creationflags=subprocess.CREATE_NEW_CONSOLE)
             else:
-                self.log(f"Delete: could not read {fname} — aborting before the data delete.")
-                return
-        else:
-            self.log(f"Delete: no workflow file found for {name} (already gone?) — continuing with the data.")
-        # 3. Delete opencode/instances/<name>/ in one git-tree commit.
-        prefix = f"opencode/instances/{name}/"
-        for attempt in range(5):
-            ref = self._api_json("GET", f"repos/{repo}/git/ref/heads/{branch}")
-            head = (ref or {}).get("object", {}).get("sha")
-            if not head:
-                self.log("Delete: could not resolve the branch head.")
-                return
-            tree = self._api_json("GET", f"repos/{repo}/git/trees/{head}?recursive=1", timeout=180)
-            if tree is None:
-                self.log("Delete: could not read the repo tree.")
-                return
-            paths = [e["path"] for e in tree.get("tree", [])
-                     if e.get("type") == "blob" and e["path"].startswith(prefix)]
-            if not paths:
-                self.log(f"No data under {prefix} (already clean).")
-                break
-            dels = [{"path": pth, "mode": "100644", "type": "blob", "sha": None} for pth in paths]
-            nt = self._api_json("POST", f"repos/{repo}/git/trees",
-                                {"base_tree": head, "tree": dels}, timeout=180)
-            if not nt:
-                self.log("Delete: creating the deletion tree failed.")
-                return
-            cm = self._api_json("POST", f"repos/{repo}/git/commits",
-                                {"message": f"Remove {name} instance data",
-                                 "tree": nt["sha"], "parents": [head]})
-            if not cm:
-                self.log("Delete: creating the deletion commit failed.")
-                return
-            rc, _ = self._gh_api("PATCH", f"repos/{repo}/git/refs/heads/{branch}", {"sha": cm["sha"]})
-            if rc == 0:
-                self.log(f"✅ Deleted {len(paths)} files under {prefix}")
-                break
-            self.log(f"Delete: branch moved during delete (attempt {attempt + 1}/5) — retrying…")
-            time.sleep(2)
-        else:
-            self.log("Delete: data delete did not land — run Delete again.")
-            return
-        self.log(f"✅ {name} deleted. Shared opencode/config untouched.")
-        self.after(0, self.reload_workflows)
-        self.after(0, self.refresh_runs)
+                subprocess.Popen(["opencode", "--server", url],
+                                 env={**os.environ,
+                                      "OPENCODE_PASSWORD": cfg["password"],
+                                      "OPENCODE_SERVER_PASSWORD": cfg["password"]})
+        except FileNotFoundError:
+            self.log("ERROR: powershell/opencode not found in PATH.")
+        except Exception as e:
+            self.log(f"Connect failed: {e}")
 
+    # -- delete old runs ------------------------------------------------------------
+    def delete_old_runs(self):
+        cfg = self.scope_repo()
+        if not cfg:
+            return
+
+        def work():
+            gh = GH(cfg["pat"])
+            runs = gh.list_completed_runs(cfg["repo"])
+            if not runs:
+                self.log(f"{cfg['label']}: no completed runs to delete")
+                return
+            # The confirmation needs the count first, and messagebox
+            # must run on the UI thread.
+            self.root.after(0, lambda: self._confirm_delete_runs(cfg, runs))
+        self.bg(work)
+
+    def _confirm_delete_runs(self, cfg, runs):
+        if not messagebox.askyesno(
+                "Delete old runs",
+                f"Delete {len(runs)} completed Actions run(s) of "
+                f"{cfg['repo']} from GitHub's history?\n\n"
+                f"Machines and their state are untouched; runs still "
+                f"in progress or queued are kept."):
+            return
+
+        def work():
+            if not self._acquire_op(f"delete old runs of {cfg['label']}"):
+                return
+            outcome = [f"{cfg['label']}: old runs deleted", True]
+            try:
+                gh = GH(cfg["pat"])
+                done = [0]
+
+                def one(r):
+                    if gh.delete_run(cfg["repo"], r["id"]):
+                        done[0] += 1
+                with ThreadPoolExecutor(max_workers=6) as ex:
+                    list(ex.map(one, runs))
+                self.log(f"{cfg['label']}: deleted {done[0]}/{len(runs)} "
+                         f"completed runs")
+                if done[0] < len(runs):
+                    outcome[:] = [f"{cfg['label']}: run cleanup finished "
+                                  f"with failures — see log", False]
+            finally:
+                self._release_op()
+                self._op_done(outcome[0], outcome[1])
+            self.refresh()
+        self.bg(work)
+
+    # -- add / create N ---------------------------------------------------------------
+    def add_instance(self):
+        cfg = self.scope_repo()
+        if not cfg:
+            self.log("add a repo first (Repos…)")
+            return
+        if not messagebox.askyesno(
+                "Add instance",
+                f"Add ONE new instance to {cfg['repo']}, cloned from "
+                f"its first machine (numbering gap-fills)?"):
+            return
+        self._start_create(cfg, 1)
+
+    def create_bulk(self):
+        """Create N dialog: pick the repo, type the count (e.g. 10);
+        the new machines are cloned from that repo's first machine."""
+        cfg = self.scope_repo() or self.target_repo()
+        if not cfg:
+            self.log("add a repo first (Repos…)")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Create N from first machine")
+        win.geometry("460x250")
+        win.configure(bg=self.BG)
+        frm = tk.Frame(win, bg=self.BG)
+        frm.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
+
+        tk.Label(frm, text="Repo:", bg=self.BG).grid(row=0, column=0, sticky="w", pady=3)
+        repo_var = tk.StringVar(value=cfg["label"])
+        combo = ttk.Combobox(frm, textvariable=repo_var, state="readonly",
+                             width=24, values=[a["label"] for a in self.settings["repos"]])
+        combo.grid(row=0, column=1, sticky="w", pady=3)
+
+        tk.Label(frm, text="How many machines:", bg=self.BG).grid(row=1, column=0, sticky="w", pady=3)
+        count_var = tk.StringVar(value="10")
+        ttk.Entry(frm, textvariable=count_var, width=8).grid(row=1, column=1, sticky="w", pady=3)
+
+        info_var = tk.StringVar(value="")
+        tk.Label(frm, textvariable=info_var, bg=self.BG, fg=self.MUTED,
+                 justify="left", wraplength=420).grid(
+                     row=2, column=0, columnspan=2, sticky="w", pady=(8, 2))
+
+        def update_info(*_a):
+            c = self.repo_by_label(repo_var.get())
+            if not c:
+                info_var.set("")
+                return
+            inst = self.instances_of(c["label"])
+            try:
+                n = int(count_var.get())
+            except ValueError:
+                info_var.set("Count must be a whole number (e.g. 10).")
+                return
+            if n < 1 or n > 100:
+                info_var.set("Count must be between 1 and 100.")
+                return
+            if inst:
+                first = sorted(inst, key=lambda x: parse_instance_name(x)[1])[0]
+                prefix = parse_instance_name(first)[0]
+                used = {parse_instance_name(x)[1] for x in inst}
+                names = [f"{prefix}{k}" for k in plan_new_numbers(used, n)]
+                info_var.set(
+                    f"Template (first machine): {first}\n"
+                    f"Will create: {', '.join(names)}\n"
+                    f"(preview from the loaded fleet — numbers that only "
+                    f"have a state dir are skipped too, so the final "
+                    f"numbering is recomputed at run time)")
+            else:
+                info_var.set(
+                    "No machines loaded for this repo — the template "
+                    "will be recovered from git history at run time "
+                    "(the most recently deleted machine).")
+
+        count_var.trace_add("write", update_info)
+        combo.bind("<<ComboboxSelected>>", update_info)
+        update_info()
+
+        btns = tk.Frame(frm, bg=self.BG)
+        btns.grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        def go():
+            try:
+                n = int(count_var.get())
+            except ValueError:
+                messagebox.showerror("Create N", "Count must be a whole number (e.g. 10).", parent=win)
+                return
+            if n < 1 or n > 100:
+                messagebox.showerror("Create N", "Count must be between 1 and 100.", parent=win)
+                return
+            c = self.repo_by_label(repo_var.get())
+            win.destroy()
+            if c:
+                self._start_create(c, n)
+
+        ttk.Button(btns, text=f"Create", style="Accent.TButton", command=go).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.LEFT, padx=2)
+
+    def _start_create(self, cfg, count):
+        def work():
+            if not self._acquire_op(
+                    f"create {count} instance(s) in {cfg['label']}"):
+                return
+            outcome = [f"{cfg['label']}: create FAILED — see log", False]
+            try:
+                created = create_instances(GH(cfg["pat"]), cfg, count, self.log)
+                if created:
+                    outcome[:] = [f"{cfg['label']}: {len(created)} "
+                                  f"instance(s) created "
+                                  f"({created[0]}..{created[-1]})", True]
+                    self.checked.update((cfg["label"], n) for n in created)
+            finally:
+                self._release_op()
+                self._op_done(outcome[0], outcome[1])
+            self.refresh()
+        self.bg(work)
+
+    # -- delete checked ---------------------------------------------------------------
+    def delete_checked(self):
+        """Bulk delete: every ticked machine, grouped per repo."""
+        by_repo = {}
+        for label, wf in sorted(self.checked):
+            cfg = self.repo_by_label(label)
+            if cfg:
+                by_repo.setdefault(label, (cfg, []))[1].append(wf)
+        if not by_repo:
+            self.log("nothing checked — tick the machines to delete first")
+            return
+        total = sum(len(v[1]) for v in by_repo.values())
+        lines = "\n".join(
+            f"• {label}: {', '.join(sorted(v[1], key=lambda n: parse_instance_name(n)[1]))}"
+            for label, v in sorted(by_repo.items()))
+        if not messagebox.askyesno(
+                "Delete checked machines",
+                f"Delete {total} checked machine(s) COMPLETELY?\n\n{lines}\n\n"
+                f"For each machine: its workflow file + ALL its data "
+                f"under opencode/instances/<name>/ (sessions, caches, "
+                f"9router db) — one commit per repo.\n\n"
+                f"The shared opencode/config is NOT touched.\n"
+                f"Active runs are cancelled and awaited first; a "
+                f"machine whose run will not stop is skipped."):
+            return
+
+        def work():
+            if not self._acquire_op(f"delete {total} checked machine(s)"):
+                return
+            outcome = [f"delete checked: {total} machine(s) deleted", True]
+            try:
+                deleted_all, skipped_all = [], []
+                for label, (cfg, names) in sorted(by_repo.items()):
+                    self.log(f"— {label} ({cfg['repo']}): deleting "
+                             f"{len(names)} machine(s)…")
+                    deleted, skipped = delete_instances(
+                        GH(cfg["pat"]), cfg, names, self.log)
+                    deleted_all += [(label, n) for n in deleted]
+                    skipped_all += [(label, n) for n in skipped]
+                for key in deleted_all:
+                    self.checked.discard(key)
+                if skipped_all:
+                    outcome[:] = [f"delete checked: {len(deleted_all)} "
+                                  f"deleted, {len(skipped_all)} skipped "
+                                  f"— see log", False]
+                elif not deleted_all:
+                    outcome[:] = ["delete checked: nothing was deleted "
+                                  "— see log", False]
+                else:
+                    outcome[:] = [f"delete checked: {len(deleted_all)} "
+                                  f"machine(s) deleted", True]
+            finally:
+                self._release_op()
+                self._op_done(outcome[0], outcome[1])
+            self.refresh()
+        self.bg(work)
+
+    # -- rename prefix ------------------------------------------------------------------
     def rename_prefix(self):
-        if self._inst_busy:
-            self.log("Another instance operation is running — wait for it to finish.")
+        cfg = self.scope_repo()
+        if not cfg:
             return
-        names = [self.wf_tree.item(i, "values")[0] for i in self.wf_tree.get_children()]
-        prefixes = {p[0] for p in (parse_instance_name(n) for n in names) if p}
+        inst = self.instances_of(cfg["label"])
+        ref = self.selected_ref()
+        prefixes = []
+        if ref and ref[1] and parse_instance_name(ref[1]):
+            prefixes.append(parse_instance_name(ref[1])[0])
+        prefixes += sorted({p[0] for p in
+                            (parse_instance_name(n) for n in inst) if p})
         if not prefixes:
-            messagebox.showwarning("Rename prefix", "No instances loaded — press Reload first.")
+            messagebox.showwarning("Rename prefix",
+                                   "No machines loaded for this repo — press Refresh first.")
             return
-        current = sorted(prefixes)[0]
+        current = prefixes[0]
         new = simpledialog.askstring(
             "Rename prefix",
-            f"Current prefix: {current}\nNew prefix:",
-            parent=self)
+            f"Repo: {cfg['repo']}\nCurrent prefix: {current}\nNew prefix:",
+            parent=self.root)
         if new is None:
             return
         new = new.strip().lower()
@@ -794,169 +1681,172 @@ class App(tk.Tk):
             return
         if not messagebox.askyesno(
                 "Rename prefix",
-                f"Rename prefix '{current}' → '{new}' in this repo?\n\n"
+                f"Rename prefix '{current}' → '{new}' in {cfg['repo']}?\n\n"
                 f"• workflow files, names and WF_NAME ({current}1 → {new}1, …)\n"
                 f"• instance data moves: opencode/instances/{current}N/ → {new}N/\n"
-                f"• machines come up as {new}1, {new}2, … on Tailscale\n\n"
-                f"NOT renamed: the h-dashboard branches (new ones are created on the "
-                f"next runs; the old {current}N branches stay as leftovers) and old "
-                f"Tailscale device entries (they expire on their own).\n"
+                f"• machines come up as {new}1, {new}2, … on Tailscale\n"
+                f"• all of it in ONE commit\n\n"
+                f"NOT renamed: the h-dashboard branches (new ones are "
+                f"created on the next runs; the old ones stay as "
+                f"leftovers) and old Tailscale device entries.\n"
                 f"Active runs will be cancelled first."):
             return
-        self._inst_busy = True
-        self.run_bg(self._rename_prefix_locked, current, new)
 
-    def _rename_prefix_locked(self, old_prefix, new_prefix):
-        try:
-            self._rename_prefix(old_prefix, new_prefix)
-        finally:
-            self._inst_busy = False
-
-    def _rename_prefix(self, old_prefix, new_prefix):
-        repo = self.repo_var.get().strip()
-        branch = self.branch_var.get().strip() or "opc"
-        if not repo:
-            self.log("Rename prefix: set the repo in Settings first.")
-            return
-        inst = self._instance_files(repo, branch)
-        targets = {}
-        for name in inst:
-            p = parse_instance_name(name)
-            if p and p[0] == old_prefix:
-                targets[name] = f"{new_prefix}{p[1]}"
-        if not targets:
-            self.log(f"Rename prefix: no {old_prefix}N instances found.")
-            return
-        # An active run would resurrect the old names/paths on its
-        # final sync — cancel all targets first.
-        for old_name in targets:
-            if not self._cancel_and_wait(old_name):
-                self.log(f"Rename aborted: {old_name} is still running.")
+        def work():
+            if not self._acquire_op(
+                    f"rename prefix {current} -> {new} in {cfg['label']}"):
                 return
-        # 1. Create the renamed workflow files (nothing deleted yet,
-        #    so a failure here leaves the repo untouched).
-        for old_name, new_name in sorted(targets.items()):
-            fname = inst[old_name]
-            tpl = self._api_json("GET", f"repos/{repo}/contents/.github/workflows/{fname}?ref={branch}")
-            if not tpl or "content" not in tpl:
-                self.log(f"Rename: could not read {fname} — aborting (nothing deleted).")
-                return
+            outcome = [f"{cfg['label']}: rename FAILED — see log", False]
             try:
-                new_text = renamed_workflow(base64.b64decode(tpl["content"]).decode("utf-8"), new_name)
-            except ValueError as e:
-                self.log(f"Rename: {e} — aborting (nothing deleted).")
+                if rename_prefix_op(GH(cfg["pat"]), cfg, current, new, self.log):
+                    outcome[:] = [f"{cfg['label']}: prefix renamed "
+                                  f"{current} -> {new}", True]
+            finally:
+                self._release_op()
+                self._op_done(outcome[0], outcome[1])
+            self.refresh()
+        self.bg(work)
+
+    # -- repos dialog ---------------------------------------------------------------------
+    def _repos_dialog(self):
+        win = tk.Toplevel(self.root)
+        win.title("Repos")
+        win.geometry("720x400")
+        lb = tk.Listbox(win, width=24)
+        lb.pack(side=tk.LEFT, fill=tk.Y, padx=6, pady=6)
+        for a in self.settings["repos"]:
+            lb.insert(tk.END, a["label"])
+
+        form = tk.Frame(win)
+        form.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=6, pady=6)
+        vars_ = {}
+        rows = [("label", "Label", 30, False),
+                ("pat", "PAT (optional — empty = gh CLI login)", 46, True),
+                ("repo", "Repo (owner/name)", 30, False),
+                ("branch", "Branch", 30, False),
+                ("password", "OpenCode server password", 30, True)]
+        for key, title, w, secret in rows:
+            r = tk.Frame(form)
+            r.pack(fill=tk.X, pady=2)
+            tk.Label(r, text=title, width=34, anchor="w").pack(side=tk.LEFT)
+            v = tk.StringVar()
+            tk.Entry(r, textvariable=v, width=w,
+                     show="•" if secret else "").pack(side=tk.LEFT)
+            vars_[key] = v
+        tk.Label(form, text="The server password is exported as "
+                            "OPENCODE_SERVER_PASSWORD for Connect and, "
+                            "on Save, persisted with setx on Windows "
+                            "(target repo only). Branch is usually "
+                            "'opc'.", fg="#666", wraplength=430,
+                 justify="left").pack(anchor="w", pady=4)
+        state = {"idx": None}
+
+        def load_fields(idx):
+            state["idx"] = idx
+            a = self.settings["repos"][idx] if idx is not None else blank_repo()
+            for k, v in vars_.items():
+                v.set(a.get(k, ""))
+
+        def flush():
+            if state["idx"] is None:
                 return
-            new_file = f"{new_name}.yml"
-            rc, _ = self._gh_api("PUT", f"repos/{repo}/contents/.github/workflows/{new_file}",
-                                 {"message": f"Rename instance {old_name} to {new_name} (prefix {old_prefix} -> {new_prefix})",
-                                  "content": base64.b64encode(new_text.encode("utf-8")).decode(),
-                                  "branch": branch})
-            if rc != 0:
-                self.log(f"Rename: creating {new_file} failed — aborting (nothing deleted).")
+            a = self.settings["repos"][state["idx"]]
+            for k, v in vars_.items():
+                a[k] = v.get().strip()
+            if a["repo"] and not a["label"]:
+                a["label"] = _label_for(a["repo"])
+            if not a["branch"]:
+                a["branch"] = "opc"
+
+        def on_select(_evt=None):
+            flush()
+            sel = lb.curselection()
+            if sel:
+                load_fields(sel[0])
+
+        lb.bind("<<ListboxSelect>>", on_select)
+
+        btns = tk.Frame(form)
+        btns.pack(fill=tk.X, pady=8)
+
+        def new_repo():
+            flush()
+            self.settings["repos"].append(blank_repo())
+            lb.insert(tk.END, "")
+            lb.selection_clear(0, tk.END)
+            lb.selection_set(tk.END)
+            load_fields(len(self.settings["repos"]) - 1)
+
+        def del_repo():
+            sel = lb.curselection()
+            if not sel:
                 return
-            self.log(f"✅ Created {new_file} ({new_name})")
-        # 2. Delete the old workflow files.
-        for old_name, new_name in sorted(targets.items()):
-            fname = inst[old_name]
-            if fname == f"{new_name}.yml":
-                continue
-            meta = self._api_json("GET", f"repos/{repo}/contents/.github/workflows/{fname}?ref={branch}")
-            if meta and meta.get("sha"):
-                rc, _ = self._gh_api("DELETE", f"repos/{repo}/contents/.github/workflows/{fname}",
-                                     {"message": f"Remove old {old_name} workflow file (renamed to {new_name})",
-                                      "sha": meta["sha"], "branch": branch})
-                if rc != 0:
-                    self.log(f"Rename: deleting old {fname} failed — delete it by hand.")
-                else:
-                    self.log(f"✅ Deleted old {fname}")
-        # 3. Move the state dirs in one git-tree commit.
-        moves = [(f"opencode/instances/{o}/", f"opencode/instances/{n}/")
-                 for o, n in sorted(targets.items())]
-        for attempt in range(5):
-            ref = self._api_json("GET", f"repos/{repo}/git/ref/heads/{branch}")
-            head = (ref or {}).get("object", {}).get("sha")
-            if not head:
-                self.log("Rename: could not resolve the branch head.")
+            del self.settings["repos"][sel[0]]
+            lb.delete(sel[0])
+            state["idx"] = None
+            load_fields(None)
+
+        def save_close():
+            if state["idx"] is None and any(
+                    v.get().strip() for v in vars_.values()):
+                # The form was filled without pressing New first —
+                # adopt the typed values as a new repo instead of
+                # silently discarding them on save.
+                self.settings["repos"].append(blank_repo())
+                lb.insert(tk.END, "")
+                state["idx"] = len(self.settings["repos"]) - 1
+            flush()
+            self.settings["repos"] = [
+                a for a in self.settings["repos"] if a.get("repo")]
+            for a in self.settings["repos"]:
+                if not a["label"]:
+                    a["label"] = _label_for(a["repo"])
+            self._sync_repo_combo()
+            try:
+                save_settings(self.settings)
+            except OSError as e:
+                messagebox.showerror(
+                    "Remote-Op",
+                    f"Could not save settings:\n{SETTINGS_PATH}\n\n{e}")
                 return
-            tree = self._api_json("GET", f"repos/{repo}/git/trees/{head}?recursive=1", timeout=180)
-            if tree is None:
-                self.log("Rename: could not read the repo tree.")
-                return
-            entries = []
-            for e in tree.get("tree", []):
-                if e.get("type") != "blob":
-                    continue
-                for old_dir, new_dir in moves:
-                    if e["path"].startswith(old_dir):
-                        entries.append({"path": new_dir + e["path"][len(old_dir):],
-                                        "mode": e["mode"], "type": "blob", "sha": e["sha"]})
-                        entries.append({"path": e["path"], "mode": "100644",
-                                        "type": "blob", "sha": None})
-                        break
-            if not entries:
-                self.log("Rename: no instance state to move (fresh repo).")
-                break
-            nt = self._api_json("POST", f"repos/{repo}/git/trees",
-                                {"base_tree": head, "tree": entries}, timeout=180)
-            if not nt:
-                self.log("Rename: creating the move tree failed.")
-                return
-            cm = self._api_json("POST", f"repos/{repo}/git/commits",
-                                {"message": f"Move instance state for prefix rename {old_prefix} -> {new_prefix}",
-                                 "tree": nt["sha"], "parents": [head]})
-            if not cm:
-                self.log("Rename: creating the move commit failed.")
-                return
-            rc, _ = self._gh_api("PATCH", f"repos/{repo}/git/refs/heads/{branch}", {"sha": cm["sha"]})
-            if rc == 0:
-                self.log(f"✅ Moved state for {len(targets)} instance(s) into opencode/instances/{new_prefix}N/")
-                break
-            self.log(f"Rename: branch moved during the state move (attempt {attempt + 1}/5) — retrying…")
-            time.sleep(2)
+            self._apply_active_password()
+            self._persist_password_setx()
+            win.destroy()
+            self.refresh()
+
+        tk.Button(btns, text="New", command=new_repo).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Delete", command=del_repo).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Save & close", command=save_close).pack(side=tk.LEFT, padx=10)
+        if self.settings["repos"]:
+            lb.selection_set(0)
+            load_fields(0)
         else:
-            self.log("Rename: the state move did not land — run Rename again to finish it.")
+            # Start with a first entry already created, so the visible
+            # form is bound to a real slot — otherwise whatever is
+            # typed first is discarded on save.
+            new_repo()
+
+    def _persist_password_setx(self):
+        """Persist the TARGET repo's server password for future
+        terminals (Windows setx), as the old single-repo app did."""
+        cfg = self.target_repo()
+        if not cfg or os.name != "nt":
             return
-        self.log(f"✅ Prefix renamed {old_prefix} -> {new_prefix}.")
-        self.after(0, self.reload_workflows)
-        self.after(0, self.refresh_runs)
-
-    # ----- uptime every 5 min -----
-    def _uptime_loop(self):
-        self.run_bg(self._check_uptime)
-        self.after(5 * 60 * 1000, self._uptime_loop)  # every 5 min
-
-    def _check_uptime(self):
-        for url in list(self.servers):
-            ok = self._ping(url)
-            now = time.strftime("%H:%M:%S")
-            if ok:
-                if url not in self.up_since:
-                    self.up_since[url] = time.time()
-                up_for = time.time() - self.up_since[url]
-                h, rem = divmod(int(up_for), 3600)
-                m, s = divmod(rem, 60)
-                txt = f"● UP  uptime {h}h {m}m {s}s"
-                col = "green"
-            else:
-                self.up_since.pop(url, None)
-                txt = "● DOWN"
-                col = "red"
-            self.after(0, self._set_srv_label, url, txt, col)
-        self.after(0, lambda: self.uptime_var.set(f"last check: {time.strftime('%H:%M:%S')} (every 5 min)"))
-
-    def _set_srv_label(self, url, txt, col):
-        lbl = self.srv_labels.get(url)
-        if lbl:
-            lbl.config(text=txt, foreground=col)
-
-    @staticmethod
-    def _ping(url, timeout=6):
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as r:
-                return r.status < 500
-        except Exception:
-            return False
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            for var in ("OPENCODE_SERVER_PASSWORD", "OPENCODE_PASSWORD"):
+                subprocess.run(["setx", var, cfg["password"]],
+                               capture_output=True, text=True, timeout=15,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+                               startupinfo=si)
+            self.log("Persisted via setx — new terminals will have "
+                     "OPENCODE_SERVER_PASSWORD (target repo).")
+        except Exception as e:
+            self.log(f"setx failed (session-only): {e}")
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
