@@ -239,7 +239,56 @@ assert "opencode/instances/rey2/db.sqlite" in gh.files
 assert ".github/workflows/rey1.yml" not in gh.files
 print("bulk delete skip-on-stuck-run OK")
 
+# --- create with COPY mode: state cloned from the first machine ------------------
+files = {".github/workflows/rey1.yml": SAMPLE,
+         "opencode/instances/rey1/data/opencode.db": "sessions+history",
+         "opencode/instances/rey1/data/shell/x/out.txt": "shell log",
+         "opencode/instances/rey1/cbm-cache/h-dashboard.db": "cbm index",
+         "opencode/instances/rey1/9router.sqlite": "9router db",
+         "opencode/config/skills/x.md": "shared"}
+gh = FakeGH(files)
+created = app.create_instances(gh, CFG, 1, log, mode="copy")
+assert created == ["rey2"], created
+assert gh.commits == 1, gh.commits  # workflows + state in ONE commit
+assert gh.files["opencode/instances/rey2/data/opencode.db"] == "sessions+history"
+assert gh.files["opencode/instances/rey2/cbm-cache/h-dashboard.db"] == "cbm index"
+assert gh.files["opencode/instances/rey2/9router.sqlite"] == "9router db"
+assert gh.files["opencode/instances/rey2/data/shell/x/out.txt"] == "shell log"
+# the template's own state is untouched, config untouched
+assert gh.files["opencode/instances/rey1/data/opencode.db"] == "sessions+history"
+assert gh.files["opencode/config/skills/x.md"] == "shared"
+print("create copy mode (state cloned, one commit) OK")
+
+# bulk copy: every new machine gets the template's state
+gh = FakeGH(files)
+created = app.create_instances(gh, CFG, 3, log, mode="copy")
+assert created == ["rey2", "rey3", "rey4"], created
+for n in ("rey2", "rey3", "rey4"):
+    assert gh.files[f"opencode/instances/{n}/9router.sqlite"] == "9router db"
+assert gh.commits == 1
+print("bulk create copy mode OK")
+
+# copy mode with NO backed-up state degrades to raw, still one commit
+gh = FakeGH({".github/workflows/rey1.yml": SAMPLE})
+created = app.create_instances(gh, CFG, 1, log, mode="copy")
+assert created == ["rey2"], created
+assert not any(p.startswith("opencode/instances/") for p in gh.files)
+assert gh.commits == 1
+print("copy mode without state -> raw fallback OK")
+
+# raw mode (default) never copies state
+gh = FakeGH(files)
+created = app.create_instances(gh, CFG, 1, log)
+assert created == ["rey2"] and not any(
+    p.startswith("opencode/instances/rey2") for p in gh.files)
+print("raw mode (default) OK")
+
 # --- rename prefix in one commit ------------------------------------------------
+files = {}
+for n in (1, 2, 3):
+    files[f".github/workflows/rey{n}.yml"] = app.renamed_workflow(SAMPLE, f"rey{n}")
+    files[f"opencode/instances/rey{n}/db.sqlite"] = "state"
+files["opencode/config/skills/x.md"] = "shared"
 gh = FakeGH(files)
 assert app.rename_prefix_op(gh, CFG, "rey", "fork", log)
 assert gh.commits == 1

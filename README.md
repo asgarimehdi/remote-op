@@ -24,15 +24,28 @@ and the same light theme.
   (across repos), or Run all / Stop all for one repo (the selected
   row's repo, else the target repo). Machines already running are
   skipped on dispatch; dispatch and cancel run in parallel.
-- **Add instance…** — creates one new instance in the selected repo,
-  cloned from its first (lowest-numbered) machine; numbering fills
-  gaps. With no machine left, the template is recovered from git
-  history (the most recently deleted workflow), as before.
-- **Create N from first…** — give a number (e.g. **10**) and that many
-  new instances are cloned from the repo's first machine in **one
-  commit**. The dialog previews the names that will be created;
-  numbers that only have a leftover state dir are skipped too, so a
-  deleted machine's data never silently revives.
+- **Add instance… / Create N from first…** — create one instance, or
+  give a number (e.g. **10**) and create that many at once, cloned
+  from the repo's first (lowest-numbered) machine in **one commit**;
+  numbering fills gaps. The dialog previews the names that will be
+  created; numbers that only have a leftover state dir are skipped
+  too, so a deleted machine's data never silently revives. With no
+  machine left, the template is recovered from git history (the most
+  recently deleted workflow), as before.
+- **Raw or Copy — asked at every create** — the create dialog asks
+  how each new machine starts:
+  - **Copy of the first machine (warm start)** — the first machine's
+    backed-up per-instance state is cloned into the new machine in
+    the same commit, reusing the same git blobs (no re-upload):
+    `data/` (sessions and history), `cbm-cache/` (the
+    codebase-memory index) and `9router.sqlite` when present. The
+    new machine boots with the first machine's history instead of
+    starting blank. If the first machine has no backed-up state,
+    Copy falls back to Raw with a log line.
+  - **Raw** — clean state, created by the machine's own first sync.
+  
+  Plugins, skills, agents and MCP config need no copying either way:
+  they live in the shared `opencode/config` every instance uses.
 - **Delete checked** — tick any machines (across repos) and delete
   them all: each machine's workflow file plus ALL of its data under
   `opencode/instances/<name>/`, in **one commit per repo**. The
