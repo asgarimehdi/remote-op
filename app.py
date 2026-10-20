@@ -1685,7 +1685,7 @@ class App:
                      "(label, repo owner/name, branch; PAT optional — "
                      "empty uses your gh CLI login). An old-format "
                      "settings.json is migrated automatically.")
-        self.root.after(60 * 1000, self._uptime_loop)
+        self.root.after(3 * 1000, self._uptime_loop)
 
     # -- plumbing -----------------------------------------------------------
     def log(self, msg):
@@ -1865,6 +1865,12 @@ class App:
                         self.runs.update(runs)
                     self._loading.discard(label)
                     self._fill_tree()
+                    if not self._loading and self.instances:
+                        # Probe readiness the moment the fleet is
+                        # loaded, not at the loop's next tick — a
+                        # machine that is already up must not sit
+                        # orange while the loop idles.
+                        self.bg(self._check_uptime)
 
                 self.root.after(0, apply)
 
@@ -2071,8 +2077,13 @@ class App:
             self.runs.get(k, {}).get("status") in ACTIVE_STATUSES
             and self._server_state(*k) != "ready"
             for k in self.instances)
-        self.root.after(30 * 1000 if starting else 5 * 60 * 1000,
-                        self._uptime_loop)
+        if starting:
+            delay = 30 * 1000
+        elif not self.instances:
+            delay = 5 * 1000  # fleet still loading — look again soon
+        else:
+            delay = 5 * 60 * 1000
+        self.root.after(delay, self._uptime_loop)
 
     @staticmethod
     def _ping(url, timeout=6):
