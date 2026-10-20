@@ -25,6 +25,25 @@ and the same light theme.
   probes run every 30 seconds during startup and every 5 minutes
   once the fleet is settled. Double-click a machine to open its
   web UI. Repo group rows tick/untick the whole repo.
+- **Browser aliases (dotted names)** — browsers refuse to save the
+  OpenCode password for a dotless address like `http://rey1:4096`,
+  so the app keeps a managed block in the Windows hosts file that
+  maps **`<name>.<suffix>`** (default suffix `op` → `rey1.op`) to
+  the machine's current Tailscale IP. The server checks keep it
+  current: the alias appears when the machine comes up, follows
+  its new IP on the next run, and is removed when it goes down.
+  Only Tailscale-range IPs (100.64.0.0/10) are ever written, and
+  only inside the app's own marked block — the rest of the hosts
+  file is untouched. The suffix is configurable in the Repos
+  dialog (empty = off), and double-click opens the alias address.
+  **One-time setup (Windows):** the hosts file is admin-owned, so
+  grant your user write access once, from an *administrator*
+  PowerShell:
+  `icacls "$env:SystemRoot\System32\drivers\etc\hosts" /grant "$($env:USERNAME):M"`
+  (Running the app as administrator instead also works.) Without
+  the grant the app logs one hint and keeps using the short names.
+  Aliases live on this PC only — on a phone, use the machine's
+  full `….ts.net` MagicDNS name, which also saves passwords.
 - **Run / Stop** — tick machines and use Run checked / Stop checked
   (across repos), or Run all / Stop all for one repo (the selected
   row's repo, else the target repo). Machines already running are

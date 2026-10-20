@@ -41,10 +41,12 @@ settings.json (single repo/password/branch) is migrated on load.
 """
 
 import base64
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -899,6 +901,73 @@ def fmt_server(state, since, now=None):
 
 
 # ---------------------------------------------------------------------------
+# Dotted browser aliases via the Windows hosts file
+# ---------------------------------------------------------------------------
+# Browsers will not save the server password for a dotless MagicDNS
+# name (http://rey1:4096), so the app keeps a managed block in the
+# Windows hosts file mapping <wf>.<suffix> (e.g. rey1.op) to the
+# machine's current Tailscale IP. Runner IPs change every run, so
+# the block is rewritten from the probe cycle: an alias exists only
+# while its machine is up. Writing the hosts file needs a one-time
+# grant (see README); without it the sync logs a hint once and the
+# short names keep working as before.
+HOSTS_APP_TAG = "Remote-Op"
+DEFAULT_DNS_SUFFIX = "op"
+
+_SUFFIX_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+
+
+def valid_suffix(s):
+    return bool(_SUFFIX_RE.match((s or "").strip().lower()))
+
+
+def machine_alias(wf, suffix):
+    """'rey1' + 'op' -> 'rey1.op'; None when the suffix is empty
+    (feature off) or not a valid single DNS label."""
+    s = (suffix or "").strip().lower()
+    return f"{wf}.{s}" if s and valid_suffix(s) else None
+
+
+def is_tailscale_ip(ip):
+    """Only Tailscale's CGNAT range may be written into hosts —
+    anything else means the short name resolved to something that
+    is not the runner (a stale record, a search-domain hit)."""
+    try:
+        return ipaddress.ip_address(ip) in ipaddress.ip_network(
+            "100.64.0.0/10")
+    except ValueError:
+        return False
+
+
+def hosts_path():
+    root = os.environ.get("SystemRoot", r"C:\Windows")
+    return os.path.join(root, "System32", "drivers", "etc", "hosts")
+
+
+def render_hosts_block(existing, entries, tag):
+    """`existing` hosts text with the app's managed block replaced
+    by `entries` ({alias: ip}); an empty entries dict removes the
+    block. Everything outside the block is preserved."""
+    begin = f"# >>> {tag} fleet aliases (managed - do not edit) >>>"
+    end = f"# <<< {tag} fleet aliases <<<"
+    block = []
+    if entries:
+        block = [begin] + [f"{entries[a]}\t{a}" for a in sorted(entries)] + [end]
+    out, skipping = [], False
+    for line in (existing or "").splitlines():
+        if line.strip() == begin:
+            skipping = True
+            continue
+        if line.strip() == end:
+            skipping = False
+            continue
+        if not skipping:
+            out.append(line)
+    out.extend(block)
+    return "\n".join(out) + "\n"
+
+
+# ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
 
@@ -945,7 +1014,9 @@ def load_settings(path=None):
     return {"repos": repos,
             "active": data.get("active", "") if isinstance(data, dict) else "",
             "hide_cancelled": bool(data.get("hide_cancelled"))
-            if isinstance(data, dict) else False}
+            if isinstance(data, dict) else False,
+            "dns_suffix": data.get("dns_suffix", DEFAULT_DNS_SUFFIX)
+            if isinstance(data, dict) else DEFAULT_DNS_SUFFIX}
 
 
 def save_settings(settings, path=None):
@@ -1514,6 +1585,8 @@ class App:
         self.instances = {}   # (label, wf) -> workflow info, ALL repos
         self.runs = {}        # (label, wf) -> latest run dict
         self.uptime = {}      # (label, wf) -> (readiness state, since ts|None)
+        self._alias_ip = {}   # (label, wf) -> Tailscale IP seen by probes
+        self._hosts_warned = False
         self._loading = set()  # repo labels whose refresh is in flight
         self.checked = set()   # (label, wf) ticked in the fleet tree
         self._op_lock = threading.Lock()
@@ -1860,6 +1933,8 @@ class App:
                             del self.runs[k]
                         for k in [k for k in self.uptime if k[0] == label]:
                             del self.uptime[k]
+                        for k in [k for k in self._alias_ip if k[0] == label]:
+                            del self._alias_ip[k]
                         for wf, info in inst.items():
                             self.instances[(label, wf)] = info
                         self.runs.update(runs)
@@ -1927,6 +2002,47 @@ class App:
         st = self.uptime.get((label, wf))
         return fmt_server(self._server_state(label, wf),
                           st[1] if st else None)
+
+    def _dns_suffix(self):
+        """The dotted-alias suffix from settings (a missing key means
+        the app default; an explicit empty string turns it off)."""
+        return (self.settings.get("dns_suffix", DEFAULT_DNS_SUFFIX)
+                or "").strip().lower()
+
+    def _sync_hosts(self):
+        """Rewrite this app's managed block in the Windows hosts
+        file from the machines currently up, so <wf>.<suffix> always
+        points at the live Tailscale IP. Windows-only, best-effort:
+        a write failure logs one hint per session, never more."""
+        if os.name != "nt":
+            return
+        entries = {}
+        for (label, wf), ip in self._alias_ip.items():
+            a = machine_alias(wf, self._dns_suffix())
+            if a:
+                entries[a] = ip
+        try:
+            path = hosts_path()
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    existing = f.read()
+            except FileNotFoundError:
+                existing = ""
+            new = render_hosts_block(existing, entries, HOSTS_APP_TAG)
+            if new != existing:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(new)
+                if entries:
+                    self.log("hosts aliases: "
+                             + ", ".join(f"{a} -> {entries[a]}"
+                                         for a in sorted(entries)))
+        except OSError as e:
+            if not self._hosts_warned:
+                self._hosts_warned = True
+                self.log(f"hosts sync FAILED ({e}) — dotted aliases "
+                         f"need the one-time write grant from the "
+                         f"README (Browser aliases); short names "
+                         f"still work")
 
     def _fill_tree(self):
         self.tree.delete(*self.tree.get_children())
@@ -2056,7 +2172,10 @@ class App:
     def _on_tree_double(self, _event=None):
         ref = self.selected_ref()
         if ref and ref[1]:
-            webbrowser.open(f"http://{ref[1]}:4096")
+            # Open the dotted alias when one is configured — that is
+            # the address the browser will save the password for.
+            host = machine_alias(ref[1], self._dns_suffix()) or ref[1]
+            webbrowser.open(f"http://{host}:4096")
 
     def _toggle_select_all(self):
         if self.select_all_var.get():
@@ -2107,6 +2226,21 @@ class App:
             state = readiness(
                 self._fully_up(wf),
                 self.runs.get(key, {}).get("status") in ACTIVE_STATUSES)
+            # The machine's current Tailscale IP, for the dotted
+            # hosts alias — only while it is up, and only when the
+            # short name really resolves into the Tailscale range.
+            ip = None
+            if state != "down":
+                try:
+                    cand = socket.gethostbyname(wf)
+                    if is_tailscale_ip(cand):
+                        ip = cand
+                except Exception:
+                    ip = None
+            if ip:
+                self._alias_ip[key] = ip
+            else:
+                self._alias_ip.pop(key, None)
             prev = self.uptime.get(key)
             since = prev[1] if (prev and prev[0] == "ready"
                                  and state == "ready") else (
@@ -2122,6 +2256,7 @@ class App:
             f"server check: {time.strftime('%H:%M:%S')} "
             f"(30s while starting, else 5 min)")
         self._fill_tree()
+        self._sync_hosts()
 
     # -- run / cancel -----------------------------------------------------------
     def _dispatch(self, cfg, wf):
@@ -2621,7 +2756,7 @@ class App:
     def _repos_dialog(self):
         win = tk.Toplevel(self.root)
         win.title("Repos")
-        win.geometry("720x400")
+        win.geometry("720x480")
         lb = tk.Listbox(win, width=24)
         lb.pack(side=tk.LEFT, fill=tk.Y, padx=6, pady=6)
         for a in self.settings["repos"]:
@@ -2649,6 +2784,23 @@ class App:
                             "(target repo only). Branch is usually "
                             "'opc'.", fg="#666", wraplength=430,
                  justify="left").pack(anchor="w", pady=4)
+        r = tk.Frame(form)
+        r.pack(fill=tk.X, pady=2)
+        tk.Label(r, text="Browser suffix (dotted alias)", width=34,
+                 anchor="w").pack(side=tk.LEFT)
+        suffix_var = tk.StringVar(
+            value=self.settings.get("dns_suffix", DEFAULT_DNS_SUFFIX))
+        tk.Entry(r, textvariable=suffix_var, width=12).pack(side=tk.LEFT)
+        tk.Label(form, text="Every up machine gets a dotted alias "
+                            "<name>.<suffix> (e.g. rey1.op) in the "
+                            "Windows hosts file, kept pointing at its "
+                            "current Tailscale IP by the server "
+                            "checks — browsers only save the OpenCode "
+                            "password for dotted addresses, and the "
+                            "alias stays the same across runs. Empty "
+                            "= off. Needs the one-time hosts write "
+                            "grant from the README.", fg="#666",
+                 wraplength=430, justify="left").pack(anchor="w", pady=2)
         state = {"idx": None}
 
         def load_fields(idx):
@@ -2705,6 +2857,15 @@ class App:
                 self.settings["repos"].append(blank_repo())
                 lb.insert(tk.END, "")
                 state["idx"] = len(self.settings["repos"]) - 1
+            sfx = suffix_var.get().strip().lower()
+            if sfx and not valid_suffix(sfx):
+                messagebox.showerror(
+                    "Repos",
+                    "Browser suffix must be a single DNS label "
+                    "(lowercase letters, digits, hyphens), e.g. op.",
+                    parent=win)
+                return
+            self.settings["dns_suffix"] = sfx
             flush()
             self.settings["repos"] = [
                 a for a in self.settings["repos"] if a.get("repo")]
