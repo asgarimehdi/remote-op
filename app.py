@@ -863,6 +863,41 @@ def fmt_remaining(mins):
     return f"{h}h{m:02d}m left" if h else f"{m}m left"
 
 
+# Ports that together mean "the machine is FULLY up": 9router starts
+# in step 12, OpenCode serve in step 13 and Laravel in step 14 (the
+# last service to boot), so all three answering means the boot has
+# finished. One early port answering does NOT make the machine
+# ready — that is exactly the old bug: the row went green as soon as
+# the run started, minutes before the machine could be used.
+READY_PORTS = (4096, 8000, 20128)
+
+
+def readiness(all_ok, run_active):
+    """A machine's readiness state: "ready" only when EVERY service
+    answers; "starting" while its run is active but the stack is not
+    fully up yet; otherwise "down"."""
+    if all_ok:
+        return "ready"
+    return "starting" if run_active else "down"
+
+
+def fmt_server(state, since, now=None):
+    """Server-column text for a readiness state (None = never probed
+    and no active run)."""
+    if state is None:
+        return "—"
+    if state == "starting":
+        return "◐ STARTING"
+    if state == "down":
+        return "● DOWN"
+    if since:
+        now = time.time() if now is None else now
+        mins = int((now - since) // 60)
+        h, m = divmod(mins, 60)
+        return f"● UP {h}h{m:02d}m" if h else f"● UP {m}m"
+    return "● UP"
+
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
@@ -1478,7 +1513,7 @@ class App:
         self.settings = load_settings()
         self.instances = {}   # (label, wf) -> workflow info, ALL repos
         self.runs = {}        # (label, wf) -> latest run dict
-        self.uptime = {}      # (label, wf) -> (up: bool, since: ts|None)
+        self.uptime = {}      # (label, wf) -> (readiness state, since ts|None)
         self._loading = set()  # repo labels whose refresh is in flight
         self.checked = set()   # (label, wf) ticked in the fleet tree
         self._op_lock = threading.Lock()
@@ -1578,6 +1613,7 @@ class App:
             self.tree.column(col, width=w)
         self.tree.tag_configure("low", foreground="#c0392b")
         self.tree.tag_configure("ok", foreground="#1e8449")
+        self.tree.tag_configure("starting", foreground="#d97706")
         self.tree.tag_configure("down", foreground="#c0392b")
         self.tree.tag_configure("acct", background="#e8eef5",
                                 font=("Segoe UI", 10, "bold"))
@@ -1870,18 +1906,21 @@ class App:
         n = sum(1 for wf in wfs if (label, wf) in self.checked)
         return 1 if n == len(wfs) else (2 if n else 0)
 
+    def _server_state(self, label, wf):
+        """The machine's readiness state: the last probe's verdict,
+        or — before any probe — "starting" when its run is already
+        active (a booting machine is never shown ready on faith),
+        else None (never probed, not running)."""
+        st = self.uptime.get((label, wf))
+        if st:
+            return st[0]
+        run = self.runs.get((label, wf), {})
+        return "starting" if run.get("status") in ACTIVE_STATUSES else None
+
     def _server_text(self, label, wf):
         st = self.uptime.get((label, wf))
-        if st is None:
-            return "—"
-        up, since = st
-        if not up:
-            return "● DOWN"
-        if since:
-            mins = int((time.time() - since) // 60)
-            h, m = divmod(mins, 60)
-            return f"● UP {h}h{m:02d}m" if h else f"● UP {m}m"
-        return "● UP"
+        return fmt_server(self._server_state(label, wf),
+                          st[1] if st else None)
 
     def _fill_tree(self):
         self.tree.delete(*self.tree.get_children())
@@ -1912,17 +1951,28 @@ class App:
                 if run.get("created_at"):
                     started = datetime.fromisoformat(
                         run["created_at"].replace("Z", "+00:00")).astimezone().strftime("%H:%M")
+                srv_state = self._server_state(label, wf)
                 if status in ("in_progress", "queued"):
                     running += 1
                     mins = remaining_minutes(run.get("created_at"), info["timeout"])
                     remaining = fmt_remaining(mins)
-                    tag = "low" if (mins is not None and mins < 120) else "ok"
+                    # Green means READY, not merely running: while
+                    # the stack is still booting the row stays orange
+                    # (starting); only a machine whose services all
+                    # answer turns green. The red low-budget warning
+                    # outranks both.
+                    if mins is not None and mins < 120:
+                        tag = "low"
+                    elif srv_state == "ready":
+                        tag = "ok"
+                    else:
+                        tag = "starting"
                 srv = self._server_text(label, wf)
                 # One row colour only (ttk tags are per-row): a DOWN
-                # server outranks the green "plenty of budget" tint,
-                # but never the red low-budget warning.
+                # server outranks the green/orange tints, but never
+                # the red low-budget warning.
                 row_tag = tag
-                if srv.startswith("● DOWN") and row_tag != "low":
+                if srv_state == "down" and row_tag != "low":
                     row_tag = "down"
                 self.tree.insert(
                     parent, tk.END, iid=f"i::{label}::{wf}",
@@ -2009,10 +2059,20 @@ class App:
             self.checked = set()
         self._fill_tree()
 
-    # -- uptime (every 5 min, integrated in the Server column) -----------------
+    # -- readiness (integrated in the Server column) ---------------------------
+    # A machine counts as UP only when its WHOLE stack answers
+    # (READY_PORTS: 9router + OpenCode + Laravel — Laravel boots
+    # last). While a machine is still starting, the loop re-checks
+    # every 30s so its row flips green the moment it is truly ready;
+    # a settled fleet is probed every 5 minutes.
     def _uptime_loop(self):
         self.bg(self._check_uptime)
-        self.root.after(5 * 60 * 1000, self._uptime_loop)
+        starting = any(
+            self.runs.get(k, {}).get("status") in ACTIVE_STATUSES
+            and self._server_state(*k) != "ready"
+            for k in self.instances)
+        self.root.after(30 * 1000 if starting else 5 * 60 * 1000,
+                        self._uptime_loop)
 
     @staticmethod
     def _ping(url, timeout=6):
@@ -2022,16 +2082,25 @@ class App:
         except Exception:
             return False
 
+    def _fully_up(self, wf):
+        """True only when every service of the machine answers."""
+        with ThreadPoolExecutor(max_workers=len(READY_PORTS)) as ex:
+            return all(ex.map(
+                lambda p: self._ping(f"http://{wf}:{p}"), READY_PORTS))
+
     def _check_uptime(self):
         keys = list(self.instances.keys())
 
         def probe(key):
             label, wf = key
-            ok = self._ping(f"http://{wf}:4096")
+            state = readiness(
+                self._fully_up(wf),
+                self.runs.get(key, {}).get("status") in ACTIVE_STATUSES)
             prev = self.uptime.get(key)
-            since = prev[1] if (prev and prev[0] and ok) else (
-                time.time() if ok else None)
-            self.uptime[key] = (ok, since)
+            since = prev[1] if (prev and prev[0] == "ready"
+                                 and state == "ready") else (
+                time.time() if state == "ready" else None)
+            self.uptime[key] = (state, since)
 
         with ThreadPoolExecutor(max_workers=8) as ex:
             list(ex.map(probe, keys))
@@ -2039,7 +2108,8 @@ class App:
 
     def _after_uptime(self):
         self.uptime_var.set(
-            f"server check: {time.strftime('%H:%M:%S')} (every 5 min)")
+            f"server check: {time.strftime('%H:%M:%S')} "
+            f"(30s while starting, else 5 min)")
         self._fill_tree()
 
     # -- run / cancel -----------------------------------------------------------

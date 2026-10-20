@@ -17,9 +17,14 @@ and the same light theme.
 - **Fleet tree** — one row per machine: workflow file, latest run,
   start time, **remaining time** out of the workflow's own
   `timeout-minutes` (under 2h left is highlighted red), and the
-  OpenCode server state (● UP + uptime / ● DOWN, re-checked every
-  5 minutes against `http://<machine>:4096`). Double-click a machine
-  to open its web UI. Repo group rows tick/untick the whole repo.
+  server state. **Green means ready, not just running:** a machine
+  counts as ● UP only when its whole stack answers — OpenCode
+  `:4096`, Laravel `:8000` and 9router `:20128` (Laravel boots
+  last, so all three answering means the boot finished). While a
+  machine is still booting its row is **orange** (◐ STARTING);
+  probes run every 30 seconds during startup and every 5 minutes
+  once the fleet is settled. Double-click a machine to open its
+  web UI. Repo group rows tick/untick the whole repo.
 - **Run / Stop** — tick machines and use Run checked / Stop checked
   (across repos), or Run all / Stop all for one repo (the selected
   row's repo, else the target repo). Machines already running are

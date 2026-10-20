@@ -72,6 +72,22 @@ assert app.remaining_minutes(started, 340, now) == 140
 assert app.fmt_remaining(140) == "2h20m left" and app.fmt_remaining(-1) == "overdue"
 print("remaining_minutes OK")
 
+# --- readiness: green only when the WHOLE stack answers -----------------------
+assert app.readiness(True, True) == "ready"
+assert app.readiness(True, False) == "ready"
+assert app.readiness(False, True) == "starting"   # running but still booting
+assert app.readiness(False, False) == "down"
+# 9router (step 12), OpenCode serve (step 13), Laravel (step 14, last)
+assert app.READY_PORTS == (4096, 8000, 20128)
+assert app.fmt_server(None, None) == "—"
+assert app.fmt_server("starting", None) == "◐ STARTING"
+assert app.fmt_server("down", None) == "● DOWN"
+assert app.fmt_server("ready", None) == "● UP"
+_now = 1_000_000.0
+assert app.fmt_server("ready", _now - 65 * 60, now=_now) == "● UP 1h05m"
+assert app.fmt_server("ready", _now - 5 * 60, now=_now) == "● UP 5m"
+print("readiness OK")
+
 # --- settings migration ---------------------------------------------------
 with tempfile.TemporaryDirectory() as td:
     p = os.path.join(td, "settings.json")
