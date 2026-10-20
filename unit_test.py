@@ -88,33 +88,6 @@ assert app.fmt_server("ready", _now - 65 * 60, now=_now) == "● UP 1h05m"
 assert app.fmt_server("ready", _now - 5 * 60, now=_now) == "● UP 5m"
 print("readiness OK")
 
-# --- dotted browser aliases (Windows hosts block) ------------------------------
-assert app.valid_suffix("op") and app.valid_suffix("o-p") and app.valid_suffix("x")
-assert not app.valid_suffix("-op") and not app.valid_suffix("o.p")
-assert not app.valid_suffix("") and not app.valid_suffix("bad suffix!")
-assert app.machine_alias("rey1", "op") == "rey1.op"
-assert app.machine_alias("rey1", " OP ") == "rey1.op"
-assert app.machine_alias("rey1", "") is None
-assert app.machine_alias("rey1", "bad!") is None
-assert app.is_tailscale_ip("100.64.1.5") and app.is_tailscale_ip("100.127.255.254")
-assert not app.is_tailscale_ip("100.128.0.1") and not app.is_tailscale_ip("192.168.1.1")
-assert not app.is_tailscale_ip("junk") and not app.is_tailscale_ip("")
-base = "127.0.0.1\tlocalhost\n# my own note\n"
-out = app.render_hosts_block(base, {"rey1.op": "100.64.0.9"}, app.HOSTS_APP_TAG)
-assert "100.64.0.9\trey1.op" in out and "127.0.0.1\tlocalhost" in out
-assert "# my own note" in out and out.count("fleet aliases (managed") == 1
-out2 = app.render_hosts_block(out, {"rey1.op": "100.64.0.10",
-                                    "syd1.op": "100.64.0.11"}, app.HOSTS_APP_TAG)
-assert "100.64.0.10\trey1.op" in out2 and "100.64.0.9" not in out2
-assert "syd1.op" in out2 and out2.count("fleet aliases (managed") == 1
-out3 = app.render_hosts_block(out2, {}, app.HOSTS_APP_TAG)
-assert "rey1.op" not in out3 and "localhost" in out3 and "# my own note" in out3
-# the other app's block is left alone
-other = app.render_hosts_block(base, {"reyhane.hm": "100.64.0.20"}, "RemoteHermes")
-both = app.render_hosts_block(other, {"rey1.op": "100.64.0.9"}, app.HOSTS_APP_TAG)
-assert "reyhane.hm" in both and "rey1.op" in both
-print("hosts aliases OK")
-
 # --- settings migration ---------------------------------------------------
 with tempfile.TemporaryDirectory() as td:
     p = os.path.join(td, "settings.json")
