@@ -24,7 +24,9 @@ Fleet operations added on the Hermes basis:
     many new instances are cloned from the repo's first (lowest-
     numbered) machine, gap-filling the numbering, in ONE commit.
     With no machine left, the template is recovered from git history,
-    as before.
+    as before; in a brand-new raw repo (no machine ever, no history)
+    the first machines are bootstrapped from the canonical workflow
+    template embedded in the app, rendered for that repo.
 
 Each repo may carry its own PAT; a repo without one falls back to the
 token of the locally logged-in gh CLI account. The per-repo OpenCode
@@ -150,6 +152,690 @@ def renamed_workflow(text, new_name):
     if not (n1 and n2 and n3):
         raise ValueError("template is missing name:/WF_NAME:/commit-message markers")
     return out
+
+
+
+# ---------------------------------------------------------------------------
+# Canonical workflow template (embedded)
+# ---------------------------------------------------------------------------
+# The current live my-opencode workflow (taken from haileen5's syd1 on
+# 2026-10-20, byte-identical to Shabakebehdasht's rey1 except the
+# identity spots) with the account-specific spots as placeholders:
+# {{WF_NAME}} the instance name, {{OWNER}} the repo owner (git identity
+# + the owner's own h-dashboard repo), {{REPO}} the full repo slug
+# (sync-back remote). A brand-new raw repo — no machine, no git
+# history — is bootstrapped from this; every other create clones a
+# real machine instead, so a fleet's own drift always wins over this
+# snapshot. Keep it in step with the live fleets when their workflow
+# changes materially.
+TEMPLATE_WORKFLOW = r'''name: {{WF_NAME}}
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      REPO_ORIGIN: https://github.com/{{OWNER}}/h-dashboard.git
+      WF_NAME: {{WF_NAME}}
+      OPENCODE_MODELS: ${{ vars.OPENCODE_DEFAULT_MODELS }}
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: 2. Setup OpenSSH Server & Set Runner Password
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+          echo "runner:${{ secrets.RUNNER_PASSWORD }}" | sudo chpasswd
+          sudo sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl restart ssh
+          sudo systemctl enable ssh
+
+      - name: 3. Setup npm, PATH, and Environment Variables Persistently
+        env:
+          GH_TOKEN: ${{ secrets.MY_PAT }}
+        run: |
+          mkdir -p ~/.npm-global
+          npm config set prefix '~/.npm-global'
+
+          echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.bashrc
+          echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.profile
+          export PATH="$HOME/.npm-global/bin:$PATH"
+
+          echo "export GH_TOKEN=$GH_TOKEN" >> ~/.bashrc
+          echo "export GH_TOKEN=$GH_TOKEN" >> ~/.profile
+          echo "GH_TOKEN=$GH_TOKEN" | sudo tee -a /etc/environment
+
+          echo 'export INITIAL_PASSWORD="${{ secrets.RUNNER_PASSWORD }}"' >> ~/.bashrc
+          echo 'export INITIAL_PASSWORD="${{ secrets.RUNNER_PASSWORD }}"' >> ~/.profile
+          echo 'INITIAL_PASSWORD="${{ secrets.RUNNER_PASSWORD }}"' | sudo tee -a /etc/environment
+
+          # CodeGraph CLI — installed here, the first step where npm is on PATH.
+          # It indexes h-dashboard in step 10b; the /usr/local/bin symlink
+          # keeps the plain `codegraph` command available in every shell.
+          npm install -g @colbymchenry/codegraph
+          if [ -x ~/.npm-global/bin/codegraph ]; then
+            sudo ln -sf ~/.npm-global/bin/codegraph /usr/local/bin/codegraph
+            echo "✅ CodeGraph installed: $(/usr/local/bin/codegraph --version)"
+          else
+            echo '⚠️ CodeGraph binary not found after installation'
+          fi
+
+      - name: 4. Install PHP 8.5 & Composer (Laravel + pgsql + redis)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lsb-release ca-certificates curl
+          # PHP now comes straight from packages.sury.org (official install
+          # per its README): the Launchpad mirror (ppa:ondrej/php) answered
+          # 503 for over an hour on 2026-10-16 and killed every run in this
+          # step, and the PPA itself announces it is merging into sury.org.
+          # The keyring package installs the repo signing key.
+          sudo curl -sSLo /tmp/debsuryorg-archive-keyring.deb https://packages.sury.org/debsuryorg-archive-keyring.deb
+          sudo dpkg -i /tmp/debsuryorg-archive-keyring.deb
+          sudo sh -c 'echo "deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ $(lsb_release -sc) main" > /etc/apt/sources.list.d/php.list'
+          php_ok=0
+          for attempt in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y \
+              php8.5 php8.5-cli php8.5-common php8.5-fpm \
+              php8.5-mbstring php8.5-xml php8.5-pgsql php8.5-curl php8.5-zip php8.5-bcmath php8.5-intl php8.5-gd \
+              php8.5-redis php8.5-tokenizer php8.5-fileinfo php8.5-ctype \
+              unzip; then
+              php_ok=1
+              break
+            fi
+            echo "⚠️ PHP install attempt $attempt failed — retrying in 20s"
+            sleep 20
+          done
+          if [ "$php_ok" != 1 ]; then
+            echo '❌ PHP install failed after 3 attempts (packages.sury.org unreachable)'
+            exit 1
+          fi
+          php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
+          sudo php composer-setup.php --install-dir=/usr/local/bin --filename=composer
+          php -r "unlink('composer-setup.php');"
+
+      - name: 5. Connect Tailscale as Exit Node & Show Access Info
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey="$TAILSCALE_AUTHKEY" --hostname="${{ env.WF_NAME }}" --advertise-exit-node --accept-routes --accept-dns
+
+          # Enable IP forwarding (required for exit node to route traffic)
+          echo 'net.ipv4.ip_forward = 1' | sudo tee -a /etc/sysctl.conf
+          echo 'net.ipv6.conf.all.forwarding = 1' | sudo tee -a /etc/sysctl.conf
+          sudo sysctl -p /etc/sysctl.conf
+
+          TS_IP=$(sudo tailscale ip -4)
+          echo "=================================================="
+          echo "  >>> SSH & WEB SERVER ARE LIVE! <<<"
+          echo "  Tailscale IP  : $TS_IP"
+          echo "  Username      : runner"
+          echo "  Password      : ${{ secrets.RUNNER_PASSWORD }}"
+          echo "  ------------------------------------------------"
+          echo "  💻 SSH: ssh runner@$TS_IP"
+          echo "  🌐 Web : http://$TS_IP:8000  (Laravel)"
+          echo "  🔀 9Router: http://$TS_IP:20128  (dashboard)"
+          echo "  🤖 OpenCode: http://$TS_IP:4096  (user: opencode, pass: RUNNER_PASSWORD)"
+          echo "  💾 Project: /home/runner/h-dashboard"
+          echo "  🌍 Exit Node: Enabled (advertise-exit-node)"
+          echo "=================================================="
+
+      - name: 6. Authenticate gh CLI & configure git credential helper
+        env:
+          GH_TOKEN: ${{ secrets.MY_PAT }}
+        run: |
+          unset GH_TOKEN
+          echo "${{ secrets.MY_PAT }}" | gh auth login --with-token
+          gh auth setup-git
+          gh auth status
+          echo "✅ GitHub CLI authenticated as: $(gh api user -q .login)"
+
+      - name: 7. Clone / sync h-dashboard and create branch
+        env:
+          GH_TOKEN: ${{ secrets.MY_PAT }}
+        run: |
+          cd /home/runner
+          if [ ! -d h-dashboard ]; then
+            git clone "$REPO_ORIGIN"
+          fi
+          cd h-dashboard
+
+          # Set git identity for commits
+          git config user.name "{{OWNER}}"
+          git config user.email "{{OWNER}}@users.noreply.github.com"
+
+          # Fetch latest origin/beta
+          git fetch origin beta
+
+          # Create / reset WF_NAME branch from origin/beta
+          git checkout -B "${WF_NAME}" origin/beta
+          echo "✅ Branch ${WF_NAME} created/reset from origin/beta"
+
+          cp .env.example.pgsql .env
+
+          # .hermes.md is not wanted — AGENTS.md is the authoritative instruction
+          # file. Drop it from the checkout and from the index (without touching
+          # beta), then exclude it so `git status` stays clean.
+          if git ls-files --error-unmatch .hermes.md >/dev/null 2>&1; then
+            git rm -q --cached .hermes.md
+          fi
+          rm -f .hermes.md
+          grep -qxF '.hermes.md' .git/info/exclude 2>/dev/null \
+            || echo '.hermes.md' >> .git/info/exclude
+          echo '✅ .hermes.md removed from the checkout and the index'
+
+      - name: 8. Start Docker Compose (PostgreSQL)
+        run: |
+          cd /home/runner/h-dashboard
+          docker compose -f docker-compose-pgsql-.yml up -d
+          echo '✅ Docker Compose started'
+
+      - name: 9. Composer, NPM, Optimize, Migrate & Seed
+        run: |
+          cd /home/runner/h-dashboard
+          composer update --no-interaction
+          npm update
+          # APP_KEY: step 7 re-copies the tracked .env template over .env on every
+          # run, and that template ships APP_KEY blank since #953 — without a key
+          # the served app throws a 500 on every web request. Generate one for
+          # this run when .env has none (artisan setup passes without it, which
+          # is why setup looked healthy while the pages failed).
+          if ! grep -q '^APP_KEY=base64:' .env; then
+            php artisan key:generate --force
+            echo '🔑 APP_KEY generated for this run'
+          fi
+          php artisan optimize:clear
+          php artisan optimize
+          php artisan migrate:fresh --seed --force
+          echo '✅ Database migrated and seeded'
+
+      - name: 10. Build frontend assets
+        run: |
+          cd /home/runner/h-dashboard
+          if ! npm run build; then
+            # npm's optional-dependencies bug (npm/cli#4828): after the
+            # `npm update` in step 9, the platform binding
+            # @rolldown/binding-linux-x64-gnu can be missing from
+            # node_modules and vite dies with "Cannot find native
+            # binding" (run 37746307765 — the identical build had passed
+            # 20 minutes earlier; the bug strikes nondeterministically).
+            # npm's own prescribed remedy is a clean reinstall without
+            # the stale lockfile; do exactly that, once, and rebuild.
+            echo '⚠️ Build failed — clean npm reinstall (stale-lock optional-deps bug), then rebuild'
+            rm -rf node_modules package-lock.json
+            npm install
+            npm run build
+          fi
+          echo '✅ Frontend assets built'
+
+      - name: 10b. Index h-dashboard with CodeGraph
+        run: |
+          cd /home/runner/h-dashboard
+          if [ -x /usr/local/bin/codegraph ]; then
+            CODEGRAPH_TELEMETRY=0 codegraph init .
+            CODEGRAPH_TELEMETRY=0 codegraph status .
+            echo '✅ CodeGraph index built for h-dashboard'
+          else
+            echo '⚠️ CodeGraph not on PATH — skipping index'
+          fi
+
+      - name: 11. Install 9router globally and create symlink
+        run: |
+          npm install -g 9router
+          if [ -f ~/.npm-global/bin/9router ]; then
+            sudo ln -sf ~/.npm-global/bin/9router /usr/local/bin/9router
+            echo '✅ 9router installed and symlinked to /usr/local/bin/9router'
+          else
+            echo '⚠️ 9router binary not found after installation'
+          fi
+
+      - name: 12. Restore 9router db backup & start hidden (tray)
+        run: |
+          export INITIAL_PASSWORD="${{ secrets.RUNNER_PASSWORD }}"
+          # Make sure the data dir exists
+          mkdir -p ~/.9router/db
+          BACKUP_DIR="${GITHUB_WORKSPACE:-.}/opencode/instances/${WF_NAME}"
+          # Restore THIS instance's backed-up 9router state. State is
+          # per-instance under opencode/instances/<wf>/ (data,
+          # cbm-cache, 9router db) so the four workflows never
+          # overwrite each other; only opencode/config stays shared.
+          if [ -f "$BACKUP_DIR/9router.sqlite" ]; then
+            cp "$BACKUP_DIR/9router.sqlite" ~/.9router/db/data.sqlite
+            echo '✅ Restored 9router data.sqlite from repo backup'
+          else
+            echo '⚠️ per-instance 9router.sqlite not found in repo — starting fresh'
+          fi
+          # Start 9router hidden in the background (tray mode) on the default port 20128.
+          # --tray is the same "hide to background" option used interactively.
+          nohup 9router --tray --skip-update -p 20128 > /tmp/9router.log 2>&1 &
+          sleep 6
+          if curl -fsS http://localhost:20128 > /dev/null 2>&1; then
+            echo '✅ 9router is live on http://localhost:20128'
+          else
+            echo '⚠️ 9router did not come up — check /tmp/9router.log'
+          fi
+
+
+      - name: 13. Install OpenCode V2, restore state, configure MCPs + Superpowers plugin & start serve
+        env:
+          OPENCODE_SERVER_PASSWORD: ${{ secrets.RUNNER_PASSWORD }}
+          OPENCODE_DISABLE_AUTOUPDATE: "true"
+          GH_TOKEN: ${{ secrets.MY_PAT }}
+        run: |
+          # 1. Install OpenCode V2 — npm package @opencode/cli (the v1
+          #    package opencode-ai stays on the 1.x line forever). Same
+          #    npm-global pattern as CodeGraph/9router, plus the
+          #    /usr/local/bin symlink. Any v1 install is removed first:
+          #    both packages ship an `opencode` binary and the official
+          #    migration guide says not to keep them side by side.
+          npm uninstall -g opencode-ai >/dev/null 2>&1 || true
+          npm install -g @opencode/cli
+          if [ -f ~/.npm-global/bin/opencode ]; then
+            sudo ln -sf ~/.npm-global/bin/opencode /usr/local/bin/opencode
+            echo "✅ OpenCode installed: $(opencode --version)"
+          else
+            echo '⚠️ opencode binary not found after installation'
+          fi
+
+          # 1b. Install codebase-memory-mcp (single static binary from its
+          #     GitHub releases): the fifth MCP server, ensured in §4. Its
+          #     own OpenCode extras (skill, agents, plugin, instructions)
+          #     are installed in §4b, and its index cache
+          #     (~/.cache/codebase-memory-mcp) is restored in §2 and synced
+          #     back to the repo in step 16.
+          #     The binary MUST live in a user-owned dir
+          #     ($HOME/.local/bin, no sudo): the `install -y` in §4b
+          #     runs an activation transaction that refuses to
+          #     proceed when the binary's install dir is root-owned
+          #     ("install_dir_not_owned_by_you") — with the old
+          #     root-owned /usr/local/bin copy, §4b silently wrote
+          #     NOTHING for the whole lifetime of these workflows.
+          mkdir -p "$HOME/.local/bin"
+          if [ ! -x "$HOME/.local/bin/codebase-memory-mcp" ]; then
+            CBM_TMP="$(mktemp -d)"
+            curl -fsSL -o "$CBM_TMP/cbm.tar.gz" https://github.com/DeusData/codebase-memory-mcp/releases/latest/download/codebase-memory-mcp-linux-amd64.tar.gz
+            tar --no-same-owner -xzf "$CBM_TMP/cbm.tar.gz" -C "$CBM_TMP"
+            install -m 0755 "$CBM_TMP/codebase-memory-mcp" "$HOME/.local/bin/codebase-memory-mcp"
+            rm -rf "$CBM_TMP"
+            echo "✅ codebase-memory-mcp installed: $("$HOME/.local/bin/codebase-memory-mcp" --version)"
+          fi
+
+          # 2. Restore the OpenCode backup from the repo (opencode/ dir,
+          #    synced back in step 16). config/ is SHARED by all four
+          #    instances (opencode.json, plugins, agents and skills —
+          #    skills stay shared on purpose), while data and the
+          #    codebase-memory index cache are PER-INSTANCE under
+          #    instances/<wf>/, so instances never clobber each other.
+          OC="${GITHUB_WORKSPACE:-.}/opencode"
+          OCI="$OC/instances/${WF_NAME}"
+          if [ -d "$OC/config" ]; then
+            mkdir -p ~/.config/opencode
+            cp -r "$OC/config/." ~/.config/opencode/
+            echo '✅ Restored OpenCode config from repo backup'
+          fi
+          if [ -d "$OCI/data" ]; then
+            mkdir -p ~/.local/share/opencode
+            cp -r "$OCI/data/." ~/.local/share/opencode/
+            echo '✅ Restored OpenCode data (sessions/db) from the per-instance backup'
+          fi
+          if [ -d "$OCI/cbm-cache" ]; then
+            mkdir -p ~/.cache/codebase-memory-mcp
+            cp -r "$OCI/cbm-cache/." ~/.cache/codebase-memory-mcp/
+            echo '✅ Restored codebase-memory-mcp index cache from the per-instance backup'
+          fi
+
+          # 3. Prepare the MCP environment. OpenCode does NOT inherit gh's
+          #    login: every MCP server is a separate process that reads only
+          #    its own env vars. So the GitHub token (same MY_PAT gh uses)
+          #    is exported here — opencode serve below inherits it, and
+          #    the config in §4 references it as
+          #    {env:...}, so NO secret lands in opencode.json (which step 16
+          #    backs up to this repo). Persisted to ~/.bashrc as well, for
+          #    shells opened later over SSH.
+          export GITHUB_PERSONAL_ACCESS_TOKEN="$GH_TOKEN"
+          echo "export GITHUB_PERSONAL_ACCESS_TOKEN=${GH_TOKEN}" >> ~/.bashrc
+          echo '✅ MCP environment prepared (GitHub token exported for opencode serve)'
+
+          # 3b. The laravel-boost MCP runs `php artisan boost:mcp` inside
+          #     h-dashboard; the package used to be composer-required by the
+          #     old Hermes step, so ensure it here (no-op if already there).
+          cd /home/runner/h-dashboard
+          if php artisan list 2>/dev/null | grep -q 'boost:mcp'; then
+            echo '✅ Laravel Boost present (boost:mcp available)'
+          else
+            composer require laravel/boost --no-interaction 2>&1 | tail -3 || true
+            php artisan boost:update 2>/dev/null || true
+            echo '✅ Laravel Boost installed for the laravel-boost MCP'
+          fi
+
+          # 4. Write/merge ~/.config/opencode/opencode.json. OpenCode reads
+          #    MCP servers ONLY from its own config. The merge ENSURES the
+          #    wanted servers (laravel-boost, github, codegraph, context7,
+          #    codebase-memory-mcp), DROPS postgis for good (removed at
+          #    Mehdi's request), and
+          #    PRESERVES any other server already in the config — servers
+          #    added at runtime are backed up by step 16 and must survive
+          #    restarts, so the mcp block is merged, never rewritten whole.
+          #    It also ensures the Superpowers plugin: V2 reads the
+          #    `plugins` array; the V1 `plugin` key is mirrored with the
+          #    same spec so a rollback to V1 would keep the plugin too.
+          #    oh-my-opencode-slim is ensured in the `plugins` array
+          #    ONLY: it is a dual-export plugin, and its own
+          #    v2-compatibility doc warns that a legacy `plugin`-key
+          #    entry gets invoked twice on v2 hosts. Its per-agent
+          #    free models are configured in §4c.
+          python3 - <<'PYEOF2'
+          import json, os
+          path = os.path.expanduser("~/.config/opencode/opencode.json")
+          cfg = {}
+          if os.path.exists(path):
+              try:
+                  cfg = json.load(open(path))
+              except Exception:
+                  cfg = {}
+          cfg.setdefault("$schema", "https://opencode.ai/config.json")
+          # Autoupdate stays OFF: the runner is ephemeral, so an
+          # /update could never persist, and the update banner
+          # only adds noise when a release lands mid-run.
+          cfg["autoupdate"] = False
+          # The default model is PER-INSTANCE and comes from the
+          # OPENCODE_DEFAULT_MODELS repository variable (repo
+          # Settings > Secrets and variables > Actions > Variables):
+          # one full model id per line. Each workflow takes its own
+          # line by number (<prefix>1 -> line 1, <prefix>2 -> line 2, ...).
+          # A shorter list wraps around instead of erroring (with
+          # 2 lines: instance 3 -> line 1, instance 4 -> line 2); an empty or
+          # unset variable falls back to the built-in list below.
+          # To change models, edit the variable only.
+          _models = [ln.strip() for ln in os.environ.get("OPENCODE_MODELS", "").splitlines() if ln.strip()]
+          if not _models:
+              _models = [
+                  "opencode/space-bunny-free",
+                  "opencode/fledge-alpha-free",
+                  "opencode/mimo-v2.6-flash-free",
+                  "opencode/muse-spark-1.3-contributor-free",
+              ]
+          # The instance number is the trailing digits of WF_NAME,
+          # whatever the prefix is (open3, mehdi3, fork12, ...): the
+          # model list is indexed by that number.
+          _wf = os.environ.get("WF_NAME", "")
+          _num = ""
+          for _ch in reversed(_wf):
+              if _ch.isdigit():
+                  _num = _ch + _num
+              else:
+                  break
+          _idx = int(_num) - 1 if _num else 0
+          cfg["model"] = _models[_idx % len(_models)]
+          mcp = cfg.get("mcp", {})
+          mcp.pop("postgis", None)
+          mcp.update({
+              "laravel-boost": {
+                  "type": "local",
+                  "command": ["bash", "-c", "cd /home/runner/h-dashboard && exec php artisan boost:mcp"],
+                  "enabled": True,
+                  "timeout": 30000,
+              },
+              "github": {
+                  "type": "local",
+                  "command": ["npx", "-y", "@modelcontextprotocol/server-github"],
+                  "environment": {
+                      "GITHUB_PERSONAL_ACCESS_TOKEN": "{env:GITHUB_PERSONAL_ACCESS_TOKEN}",
+                  },
+                  "enabled": True,
+                  "timeout": 120000,
+              },
+              "codegraph": {
+                  "type": "local",
+                  "command": ["codegraph", "serve", "--mcp"],
+                  "enabled": True,
+                  "timeout": 30000,
+              },
+              "context7": {
+                  "type": "remote",
+                  "url": "https://mcp.context7.com/mcp",
+                  "enabled": True,
+                  "timeout": 30000,
+              },
+              "codebase-memory-mcp": {
+                  "type": "local",
+                  "command": [os.path.expanduser("~/.local/bin/codebase-memory-mcp")],
+                  "enabled": True,
+                  "timeout": 60000,
+              },
+          })
+          cfg["mcp"] = mcp
+          sp_spec = "superpowers@git+https://github.com/obra/superpowers.git"
+          for pkey in ("plugins", "plugin"):
+              plist = cfg.get(pkey, [])
+              if sp_spec not in plist:
+                  plist.append(sp_spec)
+              cfg[pkey] = plist
+          slim_spec = "oh-my-opencode-slim"
+          plist = cfg.get("plugins", [])
+          if slim_spec not in plist:
+              plist.append(slim_spec)
+          cfg["plugins"] = plist
+          os.makedirs(os.path.dirname(path), exist_ok=True)
+          with open(path, "w") as f:
+              json.dump(cfg, f, indent=2)
+          print("✅ opencode.json ready: default model + mcp (laravel-boost, github, codegraph, context7, codebase-memory-mcp; postgis dropped) + superpowers & oh-my-opencode-slim plugins")
+          PYEOF2
+
+          # 4b. codebase-memory-mcp's own OpenCode integration: its skill
+          #     (~/.config/opencode/skills/codebase-memory), three read-only
+          #     agents, the cbm-augment plugin and AGENTS.md instructions.
+          #     Everything lands under ~/.config/opencode, so step 16 syncs
+          #     it like the rest of the config. Two installer quirks shape
+          #     this loop: (1) it aborts instantly when its binary is
+          #     root-owned ("install_dir_not_owned_by_you") — hence the
+          #     user-owned copy from §1b; with the old root-owned
+          #     /usr/local/bin copy this step silently wrote NOTHING for
+          #     the whole lifetime of these workflows, which is why the
+          #     extras never reached the backup; (2) its config-write ops
+          #     race each other and a random subset fails per run
+          #     ("target: does not exist or cannot be inspected" — root
+          #     runs mask it, mode bits do not bind root), so --force is
+          #     retried until every expected file is actually on disk.
+          #     The MCP entry itself is ensured by §4; this loop only
+          #     chases the extras.
+          CBM_EXTRAS="AGENTS.md skills/codebase-memory/SKILL.md agents/codebase-memory.md agents/codebase-memory-scout.md agents/codebase-memory-auditor.md plugins/cbm-augment.ts"
+          missing=1
+          for attempt in 1 2 3 4 5; do
+            "$HOME/.local/bin/codebase-memory-mcp" install -y --force > /tmp/cbm-install.log 2>&1 || true
+            chmod -R u+w ~/.config/opencode 2>/dev/null || true
+            missing=0
+            for f in $CBM_EXTRAS; do
+              [ -f "$HOME/.config/opencode/$f" ] || missing=1
+            done
+            [ "$missing" = 0 ] && break
+            echo "⚠️ codebase-memory-mcp extras incomplete after attempt $attempt — retrying"
+          done
+          if [ "$missing" = 0 ]; then
+            echo '✅ codebase-memory-mcp OpenCode extras installed (skill, 3 agents, plugin, AGENTS.md)'
+          else
+            echo '⚠️ codebase-memory-mcp extras still incomplete after 5 attempts — see /tmp/cbm-install.log; the MCP server itself is ensured in §4'
+          fi
+
+          # 4c. oh-my-opencode-slim: write/merge its config
+          #     (~/.config/opencode/oh-my-opencode-slim.json, synced by
+          #     step 16 like the rest of the config) with a "free" preset
+          #     that puts EVERY agent on a free OpenCode Zen model, plus
+          #     free councillors for the Council agent. The merge
+          #     preserves any other presets/settings already present, and
+          #     "preset" is only defaulted to "free" when unset, so a
+          #     preset later picked with /preset is not forced back.
+          #     The plugin itself is registered in §4 (plugins array).
+          #     2026-10-16 refresh against the live Zen free list:
+          #     ling-3.1-flash-free was REMOVED from Zen (the librarian
+          #     had to move), deepseek-v4.1-flash-free and
+          #     glm-5.3-flash-free are new zero-retention flash models,
+          #     and beam-free (1M, no training) is the designer —
+          #     Zen is called from the runner, so its country list
+          #     does not apply to this setup (Mehdi, 2026-10-16).
+          #     2026-10-17: beam-free is Reflection Beam, the
+          #     de-stealthed successor of cat-jam-free (deprecated,
+          #     gone from the live Zen list); same interface.
+          python3 - <<'PYEOF3'
+          import json, os
+          path = os.path.expanduser("~/.config/opencode/oh-my-opencode-slim.json")
+          cfg = {}
+          if os.path.exists(path):
+              try:
+                  cfg = json.load(open(path))
+              except Exception:
+                  cfg = {}
+          free_models = {
+              "orchestrator": "opencode/deepseek-v4.1-flash-free",
+              "oracle": "opencode/nemotron-3-ultra-free",
+              "explorer": "opencode/glm-5.3-flash-free",
+              "fixer": "opencode/deepseek-v4.1-flash-free",
+              "librarian": "opencode/glm-5.3-flash-free",
+              "designer": "opencode/beam-free",
+              "council": "opencode/nemotron-3-ultra-free",
+          }
+          free_preset = cfg.setdefault("presets", {}).setdefault("free", {})
+          for agent, model in free_models.items():
+              free_preset.setdefault(agent, {})["model"] = model
+          councillors = cfg.setdefault("council", {}).setdefault("presets", {}).setdefault("default", {})
+          # Migration for this refresh: the previously managed
+          # councillors "mimo"/"spark" are superseded by the names
+          # below; pop them so a synced config keeps no stale ones.
+          for stale in ("mimo", "spark"):
+              councillors.pop(stale, None)
+          for cname, cmodel in (("deepseek", "opencode/deepseek-v4.1-flash-free"),
+                                ("nemotron", "opencode/nemotron-3-ultra-free"),
+                                ("glm", "opencode/glm-5.3-flash-free")):
+              councillors.setdefault(cname, {})["model"] = cmodel
+          cfg["council"].setdefault("default_preset", "default")
+          cfg.setdefault("preset", "free")
+          with open(path, "w") as f:
+              json.dump(cfg, f, indent=2)
+          print("✅ oh-my-opencode-slim.json ready: 'free' preset — every agent on a free OpenCode Zen model")
+          PYEOF3
+
+          # 5. Start opencode serve in the background on 0.0.0.0:4096 so it
+          #    is reachable over Tailscale. HTTP Basic Auth comes from the
+          #    OPENCODE_SERVER_PASSWORD step env (= RUNNER_PASSWORD secret);
+          #    the username defaults to "opencode".
+          cd /home/runner/h-dashboard
+          nohup opencode serve --hostname 0.0.0.0 --port 4096 > /tmp/opencode.log 2>&1 &
+          sleep 6
+          if curl -fsS -u "opencode:${OPENCODE_SERVER_PASSWORD}" http://localhost:4096/api/info > /dev/null 2>&1; then
+            echo '✅ opencode serve is live on http://localhost:4096 (basic auth: opencode / RUNNER_PASSWORD)'
+          else
+            echo '⚠️ opencode serve did not come up — check /tmp/opencode.log'
+          fi
+
+      - name: 14. Start Laravel Development Server
+        run: |
+          cd /home/runner/h-dashboard
+          nohup php artisan serve --host=0.0.0.0 > /dev/null 2>&1 &
+          echo '✅ Laravel server started on port 8000'
+
+      - name: 15. Server Keep-Alive (5h 40m)
+        run: |
+          for i in {1..340}; do
+            sleep 60
+            echo "[$i/340] Server is active (SSH + Laravel :8000 + OpenCode :4096)..."
+          done
+
+      - name: 16. Sync opencode state & 9router data back to my-opencode
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.MY_PAT }}
+        run: |
+          cd "${GITHUB_WORKSPACE:-.}"
+          git config user.name "{{OWNER}}"
+          git config user.email "{{OWNER}}@users.noreply.github.com"
+          # Authenticate with PAT for push
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/{{REPO}}.git"
+
+          # 1. Copy OpenCode state back to the repo. Layout:
+          #    opencode/config mirrors ~/.config/opencode and is SHARED
+          #    by all four instances (skills included); everything
+          #    instance-specific goes under opencode/instances/<wf>/:
+          #    data mirrors ~/.local/share/opencode (sessions,
+          #    opencode.db, storage), cbm-cache mirrors
+          #    ~/.cache/codebase-memory-mcp, and 9router.sqlite is this
+          #    instance's 9router db. Restored in steps 12 and 13.
+          ODEST=opencode
+          OINST="$ODEST/instances/${WF_NAME}"
+          mkdir -p "$ODEST/config" "$OINST/data" "$OINST/cbm-cache"
+          [ -d ~/.config/opencode ] && cp -r ~/.config/opencode/. "$ODEST/config/"
+          [ -d ~/.local/share/opencode ] && cp -r ~/.local/share/opencode/. "$OINST/data/"
+          [ -d ~/.cache/codebase-memory-mcp ] && cp -r ~/.cache/codebase-memory-mcp/. "$OINST/cbm-cache/"
+          # Prune what must not be committed:
+          #  - data/auth.json holds provider API keys in plaintext — never
+          #    back credentials up to git (the free Zen model needs no key).
+          #  - data/snapshot (git object store behind session revert) and
+          #    data/log are bulky/regenerable; data/bin is downloaded tool
+          #    binaries; config/node_modules is plugin deps (reinstalled).
+          for junk in "$OINST/data/auth.json" "$OINST/data/snapshot" \
+                      "$OINST/data/log" "$OINST/data/bin" \
+                      "$ODEST/config/node_modules" \
+                      "$OINST/cbm-cache/logs"; do
+            if [ -e "$junk" ]; then
+              echo "🧹 Excluding from backup: $junk"
+              rm -rf "$junk"
+            fi
+          done
+          # Guard — no nested git repos inside the backup: a stray .git
+          # would be recorded as a gitlink (mode 160000) with no .gitmodules
+          # and the NEXT run's checkout dies with 'No url found for
+          # submodule path' (the my-sev/my-reb breakage). Strip any found.
+          find "$ODEST" -name .git -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          find "$ODEST" -name .git -type f -delete 2>/dev/null || true
+          echo '✅ Copied OpenCode state → opencode/ (shared config + per-instance dirs) for backup'
+
+          # 2. Copy this instance's 9router database back to the repo
+          if [ -f ~/.9router/db/data.sqlite ]; then
+            cp ~/.9router/db/data.sqlite "$OINST/9router.sqlite"
+            echo '✅ Copied 9router db → opencode/instances/${WF_NAME}/9router.sqlite for backup'
+          fi
+
+          # 3. Commit & push if anything changed. Stage FIRST, then judge
+          #    from the staged diff: plain `git diff` is blind to untracked
+          #    files, so checking before `git add` misses a brand-new
+          #    opencode/ backup entirely (the first op2 run lost its backup
+          #    exactly this way — the step reported success in under a
+          #    second and pushed nothing).
+          git add -A opencode/
+          if git diff --cached --quiet; then
+            echo 'ℹ️ No changes to commit'
+          else
+            git commit -m "Sync opencode state & 9router data from {{WF_NAME}} instance"
+            # Pull first in case another run pushed before us
+            git pull --rebase origin "${{ github.ref_name }}" || true
+            git push origin "${{ github.ref_name }}" || echo '⚠️ Push failed — changes saved locally'
+            echo '✅ OpenCode & 9router data synced to my-opencode'
+          fi
+
+
+      - name: 17. Tailscale Logout (cleanup on shutdown)
+        if: always()
+        run: |
+          sudo tailscale logout || true
+          echo "✅ Tailscale logout executed — hostname freed"
+'''
+
+
+def embedded_template(name, repo):
+    """TEMPLATE_WORKFLOW rendered for instance `name` in repo
+    `owner/name`: the owner's h-dashboard is the dashboard origin and
+    the git identity, exactly as in the live fleets."""
+    owner = repo.split("/")[0] if "/" in repo else repo
+    return (TEMPLATE_WORKFLOW
+            .replace("{{WF_NAME}}", name)
+            .replace("{{OWNER}}", owner)
+            .replace("{{REPO}}", repo))
 
 
 def workflow_timeout(text):
@@ -519,14 +1205,18 @@ def cancel_and_wait(gh, repo, branch, wf, workflow_file, log):
     return False
 
 
-def create_instances(gh, cfg, count, log, mode="raw"):
+def create_instances(gh, cfg, count, log, mode="raw", prefix_hint=None):
     """Clone `count` new instances from the repo's FIRST machine.
 
     The template is the lowest-numbered instance's workflow file (or,
     with no machine left, the most recently deleted one from git
-    history). Numbering gap-fills over workflow numbers ∪ state-dir
-    numbers. All new files land in ONE git-tree commit. Returns the
-    created instance names ([] when nothing was created).
+    history; or, in a brand-new raw repo where no machine ever
+    existed, the canonical workflow embedded in the app —
+    TEMPLATE_WORKFLOW rendered for this repo, with `prefix_hint` as
+    the instance prefix, default "op"). Numbering gap-fills over
+    workflow numbers ∪ state-dir numbers. All new files land in ONE
+    git-tree commit. Returns the created instance names ([] when
+    nothing was created).
 
     mode="copy" also clones the template's backed-up per-instance
     state — every blob under opencode/instances/<template>/ (data/:
@@ -542,6 +1232,7 @@ def create_instances(gh, cfg, count, log, mode="raw"):
     """
     repo, branch = cfg["repo"], cfg["branch"]
     inst = gh.list_instances(repo, branch)
+    embedded = False
     if inst:
         template_name = sorted(
             inst, key=lambda n: parse_instance_name(n)[1])[0]
@@ -550,13 +1241,26 @@ def create_instances(gh, cfg, count, log, mode="raw"):
             f"({inst[template_name]['file']})")
     else:
         hist = gh.history_template(repo, branch)
-        if not hist:
-            log("no instance workflow found, and none in git history "
-                "either — nothing to clone from")
-            return []
-        template_name, template_text = hist
-        log(f"repo is empty — using the last deleted workflow "
-            f"({template_name}) from git history as the template")
+        if hist:
+            template_name, template_text = hist
+            log(f"repo is empty — using the last deleted workflow "
+                f"({template_name}) from git history as the template")
+        else:
+            # Brand-new raw repo: no machine ever existed here, so
+            # there is nothing to clone and nothing in history either.
+            # Bootstrap from the canonical workflow embedded in the
+            # app, rendered for THIS repo (owner/slug), instead of
+            # dead-ending. The machines start raw — a new repo has no
+            # backed-up state anywhere to copy.
+            pfx = prefix_hint if prefix_hint and valid_prefix(
+                prefix_hint) else "op"
+            template_name = f"{pfx}1"
+            template_text = embedded_template(template_name, repo)
+            embedded = True
+            log(f"repo is brand-new (no machines, none in git history) "
+                f"— bootstrapping from the workflow template embedded "
+                f"in Remote-Op, prefix '{pfx}' (change it later with "
+                f"Rename prefix… if you want another)")
     prefix = parse_instance_name(template_name)[0]
     used = {parse_instance_name(n)[1] for n in inst}
     used |= gh.state_numbers(repo, branch)
@@ -586,7 +1290,10 @@ def create_instances(gh, cfg, count, log, mode="raw"):
     # each new instance's dir — nothing is re-uploaded, however large
     # the state is.
     src_state = []
-    if mode == "copy":
+    if mode == "copy" and embedded:
+        log("copy mode: a brand-new repo has no backed-up state to "
+            "copy — creating raw (first sync creates the state)")
+    elif mode == "copy":
         head = gh.ref_head(repo, branch)
         if head:
             prefix = f"opencode/instances/{template_name}/"
@@ -1538,7 +2245,9 @@ class App:
         (clean state) or a COPY of the first machine (its backed-up
         state cloned: sessions/history, codebase-memory index and
         9router db; plugins & skills are shared config and come along
-        either way)."""
+        either way). When the chosen repo has no machines, a prefix
+        field appears too: it names the machines when a brand-new
+        repo is bootstrapped from the embedded template."""
         cfg = self.scope_repo() or self.target_repo()
         if not cfg:
             self.log("add a repo first (Repos…)")
@@ -1546,7 +2255,7 @@ class App:
         win = tk.Toplevel(self.root)
         win.title("Add instance" if preset_count == 1
                   else "Create N from first machine")
-        win.geometry(f"500x470+{self.root.winfo_rootx() + 140}"
+        win.geometry(f"500x500+{self.root.winfo_rootx() + 140}"
                      f"+{self.root.winfo_rooty() + 90}")
         win.configure(bg=self.BG)
         frm = tk.Frame(win, bg=self.BG)
@@ -1565,10 +2274,16 @@ class App:
         if preset_count:
             ent.state(["disabled"])
 
+        prefix_var = tk.StringVar(value="op")
+        prefix_lbl = tk.Label(frm, text="New prefix:", bg=self.BG)
+        prefix_lbl.grid(row=2, column=0, sticky="w", pady=3)
+        prefix_ent = ttk.Entry(frm, textvariable=prefix_var, width=12)
+        prefix_ent.grid(row=2, column=1, sticky="w", pady=3)
+
         mode_var = tk.StringVar(value="copy")
-        tk.Label(frm, text="Start state:", bg=self.BG).grid(row=2, column=0, sticky="nw", pady=(8, 3))
+        tk.Label(frm, text="Start state:", bg=self.BG).grid(row=3, column=0, sticky="nw", pady=(8, 3))
         modes = tk.Frame(frm, bg=self.BG)
-        modes.grid(row=2, column=1, sticky="w", pady=(8, 3))
+        modes.grid(row=3, column=1, sticky="w", pady=(8, 3))
         tk.Radiobutton(modes, bg=self.BG, activebackground=self.BG,
                        variable=mode_var, value="copy", wraplength=320,
                        justify="left",
@@ -1584,13 +2299,13 @@ class App:
                            "in the shared opencode/config — every new "
                            "machine gets those either way.",
                  bg=self.BG, fg=self.MUTED, justify="left",
-                 wraplength=430).grid(row=3, column=0, columnspan=2,
+                 wraplength=430).grid(row=4, column=0, columnspan=2,
                                       sticky="w", pady=(2, 0))
 
         info_var = tk.StringVar(value="")
         tk.Label(frm, textvariable=info_var, bg=self.BG, fg=self.MUTED,
                  justify="left", wraplength=430).grid(
-                     row=4, column=0, columnspan=2, sticky="w", pady=(8, 2))
+                     row=5, column=0, columnspan=2, sticky="w", pady=(8, 2))
 
         def update_info(*_a):
             c = self.repo_by_label(repo_var.get())
@@ -1598,6 +2313,14 @@ class App:
                 info_var.set("")
                 return
             inst = self.instances_of(c["label"])
+            # The prefix field matters only when the repo has no
+            # machine to clone from (history / brand-new bootstrap).
+            if inst:
+                prefix_lbl.grid_remove()
+                prefix_ent.grid_remove()
+            else:
+                prefix_lbl.grid()
+                prefix_ent.grid()
             try:
                 n = int(count_var.get())
             except ValueError:
@@ -1623,20 +2346,28 @@ class App:
                     f"have a state dir are skipped too, so the final "
                     f"numbering is recomputed at run time)")
             else:
+                pfx = prefix_var.get().strip() or "op"
+                names = [f"{pfx}{k}" for k in plan_new_numbers(set(), n)]
                 info_var.set(
-                    "No machines loaded for this repo — the template "
-                    "will be recovered from git history at run time "
-                    "(the most recently deleted machine). Copy falls "
-                    "back to raw there: a deleted machine's state is "
-                    "not recovered.")
+                    "No machines loaded for this repo — at run time "
+                    "the template comes from git history if a machine "
+                    "was deleted here before. On a brand-new repo "
+                    "(no history either) the workflow template "
+                    "embedded in Remote-Op is used instead, rendered "
+                    "for this repo.\n"
+                    f"If it is brand-new, will create: "
+                    f"{', '.join(names)}\n"
+                    "Copy falls back to raw in both cases: there is "
+                    "no live state to clone.")
 
         count_var.trace_add("write", update_info)
         mode_var.trace_add("write", update_info)
+        prefix_var.trace_add("write", update_info)
         combo.bind("<<ComboboxSelected>>", update_info)
         update_info()
 
         btns = tk.Frame(frm, bg=self.BG)
-        btns.grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        btns.grid(row=6, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         def go():
             try:
@@ -1649,14 +2380,22 @@ class App:
                 return
             c = self.repo_by_label(repo_var.get())
             mode = mode_var.get()
+            pfx = prefix_var.get().strip()
+            if pfx and not valid_prefix(pfx):
+                messagebox.showerror(
+                    "Create",
+                    "Prefix must start and end with a letter "
+                    "(lowercase letters, digits and hyphens inside), "
+                    "e.g. rey, syd, open.", parent=win)
+                return
             win.destroy()
             if c:
-                self._start_create(c, n, mode)
+                self._start_create(c, n, mode, prefix=pfx or None)
 
         ttk.Button(btns, text="Create", style="Accent.TButton", command=go).pack(side=tk.LEFT, padx=2)
         ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.LEFT, padx=2)
 
-    def _start_create(self, cfg, count, mode="copy"):
+    def _start_create(self, cfg, count, mode="copy", prefix=None):
         def work():
             if not self._acquire_op(
                     f"create {count} instance(s) in {cfg['label']} "
@@ -1665,7 +2404,8 @@ class App:
             outcome = [f"{cfg['label']}: create FAILED — see log", False]
             try:
                 created = create_instances(GH(cfg["pat"]), cfg, count,
-                                           self.log, mode=mode)
+                                           self.log, mode=mode,
+                                           prefix_hint=prefix)
                 if created:
                     outcome[:] = [f"{cfg['label']}: {len(created)} "
                                   f"instance(s) created "

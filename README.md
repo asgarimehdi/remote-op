@@ -31,7 +31,16 @@ and the same light theme.
   created; numbers that only have a leftover state dir are skipped
   too, so a deleted machine's data never silently revives. With no
   machine left, the template is recovered from git history (the most
-  recently deleted workflow), as before.
+  recently deleted workflow), as before. In a **brand-new raw repo**
+  — a fresh account where no machine ever existed and there is no
+  history either — the first machines are bootstrapped from the
+  canonical workflow template embedded in the app, rendered for that
+  repo (its owner becomes the git identity and its `h-dashboard`
+  origin); the dialog then asks for the instance prefix (default
+  `op`). Such machines necessarily start Raw: there is no state
+  anywhere to copy yet. The repo still needs the account's usual
+  secrets (`MY_PAT`, `RUNNER_PASSWORD`, `TAILSCALE_AUTHKEY`) set by
+  its owner before the first run can succeed.
 - **Raw or Copy — asked at every create** — the create dialog asks
   how each new machine starts:
   - **Copy of the first machine (warm start)** — the first machine's

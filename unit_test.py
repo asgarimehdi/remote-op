@@ -216,6 +216,40 @@ created = app.create_instances(gh, CFG, 2, log)
 assert created == ["rey1", "rey2"], created
 print("bulk create from history OK")
 
+# --- bulk create on a BRAND-NEW repo falls back to the embedded template ------
+gh = FakeGH({})
+gh._history = None  # no machine ever existed here, nothing in history
+created = app.create_instances(gh, CFG, 2, log, prefix_hint="syd")
+assert created == ["syd1", "syd2"], created
+assert gh.commits == 1, gh.commits  # ONE commit for both
+text = gh.files[".github/workflows/syd1.yml"]
+assert app.workflow_instance(text) == "syd1"
+# rendered for CFG's repo o/r: owner o, its h-dashboard, the repo slug
+assert "https://github.com/o/h-dashboard.git" in text
+assert 'git config user.name "o"' in text
+assert "github.com/o/r.git" in text
+assert "{{WF_NAME}}" not in text and "{{OWNER}}" not in text
+assert "{{REPO}}" not in text
+assert app.workflow_instance(gh.files[".github/workflows/syd2.yml"]) == "syd2"
+print("bulk create on brand-new repo (embedded template) OK")
+
+# default prefix when none is hinted; copy mode degrades to raw there
+gh = FakeGH({})
+created = app.create_instances(gh, CFG, 1, log, mode="copy")
+assert created == ["op1"], created
+assert not any(p.startswith("opencode/instances/") for p in gh.files)
+print("brand-new repo default prefix + copy->raw OK")
+
+# the embedded render carries the live fleets' identity pattern
+t = app.embedded_template("rey1", "Shabakebehdasht/my-opencode")
+assert 'git config user.name "Shabakebehdasht"' in t
+assert "https://github.com/Shabakebehdasht/h-dashboard.git" in t
+assert "github.com/Shabakebehdasht/my-opencode.git" in t
+assert app.workflow_timeout(t) == 340
+out = app.renamed_workflow(t, "rey7")
+assert app.workflow_instance(out) == "rey7"
+print("embedded template render OK")
+
 # --- bulk delete: checked machines, one commit, config untouched --------------
 files = {}
 for n in (1, 2, 3):
