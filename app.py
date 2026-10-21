@@ -557,10 +557,10 @@ jobs:
           _models = [ln.strip() for ln in os.environ.get("OPENCODE_MODELS", "").splitlines() if ln.strip()]
           if not _models:
               _models = [
-                  "opencode/space-bunny-free",
-                  "opencode/fledge-alpha-free",
+                  "opencode/deepseek-v4.1-flash-free",
+                  "opencode/glm-5.3-flash-free",
                   "opencode/mimo-v2.6-flash-free",
-                  "opencode/muse-spark-1.3-contributor-free",
+                  "opencode/beam-free",
               ]
           # The instance number is the trailing digits of WF_NAME,
           # whatever the prefix is (open3, mehdi3, fork12, ...): the
