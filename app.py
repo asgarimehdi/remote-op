@@ -546,15 +546,26 @@ jobs:
           # only adds noise when a release lands mid-run.
           cfg["autoupdate"] = False
           # The default model is PER-INSTANCE and comes from the
-          # OPENCODE_DEFAULT_MODELS repository variable (repo
-          # Settings > Secrets and variables > Actions > Variables):
-          # one full model id per line. Each workflow takes its own
-          # line by number (<prefix>1 -> line 1, <prefix>2 -> line 2, ...).
-          # A shorter list wraps around instead of erroring (with
-          # 2 lines: instance 3 -> line 1, instance 4 -> line 2); an empty or
-          # unset variable falls back to the built-in list below.
-          # To change models, edit the variable only.
-          _models = [ln.strip() for ln in os.environ.get("OPENCODE_MODELS", "").splitlines() if ln.strip()]
+          # opencode/default-models.txt file in this repo: one full
+          # model id per line (# comments and blank lines ignored).
+          # The file wins whenever it has at least one model line, so
+          # models are changed by a plain commit to that file. If the
+          # file is missing or empty, the OPENCODE_DEFAULT_MODELS
+          # repository variable (repo Settings > Secrets and variables
+          # > Actions > Variables) applies; if that is empty or unset
+          # too, the built-in list below is the last resort. Each
+          # workflow takes its own line by number (<prefix>1 -> line 1,
+          # <prefix>2 -> line 2, ...). A shorter list wraps around
+          # instead of erroring (with 2 lines: instance 3 -> line 1,
+          # instance 4 -> line 2).
+          _models = []
+          try:
+              with open(os.path.join(os.environ.get("GITHUB_WORKSPACE", "."), "opencode/default-models.txt")) as _mf:
+                  _models = [ln.strip() for ln in _mf if ln.strip() and not ln.strip().startswith("#")]
+          except OSError:
+              _models = []
+          if not _models:
+              _models = [ln.strip() for ln in os.environ.get("OPENCODE_MODELS", "").splitlines() if ln.strip()]
           if not _models:
               _models = [
                   "opencode/deepseek-v4.1-flash-free",
