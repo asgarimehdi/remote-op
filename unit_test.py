@@ -88,6 +88,25 @@ assert app.fmt_server("ready", _now - 65 * 60, now=_now) == "● UP 1h05m"
 assert app.fmt_server("ready", _now - 5 * 60, now=_now) == "● UP 5m"
 print("readiness OK")
 
+# --- uptime anchor: the run's own start, never the probe moment ---------------
+import datetime as _dt
+_t0 = _dt.datetime(2026, 10, 21, 10, 0, 0, tzinfo=_dt.timezone.utc).timestamp()
+assert app.iso_ts("2026-10-21T10:00:00Z") == _t0
+assert app.iso_ts(None) is None and app.iso_ts("") is None
+assert app.iso_ts("junk") is None
+_run = {"run_started_at": "2026-10-21T10:00:00Z",
+        "created_at": "2026-10-21T09:58:00Z"}
+assert app.ready_since(_run, None, now=_t0 + 7200) == _t0
+assert app.ready_since({"created_at": "2026-10-21T09:58:00Z"}, None,
+                       now=_t0) == _t0 - 120
+assert app.ready_since({}, ("ready", 123.0), now=_t0) == 123.0
+assert app.ready_since({}, None, now=_t0) == _t0
+assert app.ready_since({}, ("starting", None), now=_t0) == _t0
+# two machines started an hour apart keep exactly an hour's difference
+assert app.ready_since(_run, None) - app.ready_since(
+    {"run_started_at": "2026-10-21T09:00:00Z"}, None) == 3600
+print("uptime anchor OK")
+
 # --- settings migration ---------------------------------------------------
 with tempfile.TemporaryDirectory() as td:
     p = os.path.join(td, "settings.json")

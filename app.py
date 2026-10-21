@@ -557,10 +557,10 @@ jobs:
           _models = [ln.strip() for ln in os.environ.get("OPENCODE_MODELS", "").splitlines() if ln.strip()]
           if not _models:
               _models = [
-                  "opencode/deepseek-v4.1-flash-free",
-                  "opencode/glm-5.3-flash-free",
+                  "opencode/space-bunny-free",
+                  "opencode/fledge-alpha-free",
                   "opencode/mimo-v2.6-flash-free",
-                  "opencode/beam-free",
+                  "opencode/muse-spark-1.3-contributor-free",
               ]
           # The instance number is the trailing digits of WF_NAME,
           # whatever the prefix is (open3, mehdi3, fork12, ...): the
@@ -896,6 +896,34 @@ def fmt_server(state, since, now=None):
         h, m = divmod(mins, 60)
         return f"● UP {h}h{m:02d}m" if h else f"● UP {m}m"
     return "● UP"
+
+
+def iso_ts(s):
+    """Epoch seconds for a GitHub ISO timestamp ('...Z'), or None."""
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except (ValueError, AttributeError):
+        return None
+
+
+def ready_since(run, prev, now=None):
+    """The moment a ready machine's UP duration counts from: when
+    its current run actually started (GitHub's run_started_at,
+    falling back to created_at). NOT the moment this app first saw
+    the machine ready — stamping the probe time made every
+    already-up machine show the same, wrong uptime (identical for
+    the whole fleet, counting from when the app happened to look).
+    Only when the run carries no timestamps at all does the
+    previous/first-observation stamp survive as a fallback."""
+    ts = iso_ts((run or {}).get("run_started_at")) \
+        or iso_ts((run or {}).get("created_at"))
+    if ts is not None:
+        return ts
+    if prev and prev[0] == "ready" and prev[1]:
+        return prev[1]
+    return time.time() if now is None else now
 
 
 # ---------------------------------------------------------------------------
@@ -2104,13 +2132,12 @@ class App:
 
         def probe(key):
             label, wf = key
+            run = self.runs.get(key, {})
             state = readiness(
                 self._fully_up(wf),
-                self.runs.get(key, {}).get("status") in ACTIVE_STATUSES)
+                run.get("status") in ACTIVE_STATUSES)
             prev = self.uptime.get(key)
-            since = prev[1] if (prev and prev[0] == "ready"
-                                 and state == "ready") else (
-                time.time() if state == "ready" else None)
+            since = ready_since(run, prev) if state == "ready" else None
             self.uptime[key] = (state, since)
 
         with ThreadPoolExecutor(max_workers=8) as ex:
