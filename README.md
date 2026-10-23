@@ -77,8 +77,13 @@ and the same light theme.
   reads; `OPENCODE_PASSWORD` is set alongside for legacy tooling).
   Saving the Repos dialog also persists the *target* repo's password
   with `setx` on Windows, as the old app did.
-- **Delete old runs** — clears a repo's completed Actions runs from
-  GitHub history (up to 500); machines and state are untouched.
+- **Delete old runs (all)** — clears the completed Actions runs of
+  **every configured repo** in one go (up to 500 per repo): the
+  counts of all repos are fetched in parallel, a single
+  confirmation shows the per-repo breakdown and the total, and
+  the deletion then runs in parallel across repos. One repo
+  failing does not stop the others. Machines and state are
+  untouched.
 - **Hide cancelled** — drops machines whose latest run ended
   cancelled from the tree.
 

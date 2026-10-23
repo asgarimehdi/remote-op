@@ -1244,6 +1244,71 @@ class GH:
 
 
 # ---------------------------------------------------------------------------
+# Delete old runs — fleet-wide (ALL accounts/repos at once)
+# ---------------------------------------------------------------------------
+
+def fetch_old_runs_all(targets, gh_factory, repo_of):
+    """Completed runs of EVERY target, fetched IN PARALLEL.
+
+    `targets` is the app's configured accounts/repos, `gh_factory`
+    builds a GH client from a target's PAT, `repo_of` extracts the
+    hub/repo slug. One dict per target, IN TARGET ORDER:
+    {"target", "label", "repo", "runs", "error"}. A target whose
+    fetch raises lands with runs=[] and its error set — it never
+    stops the others (a dead token must not block the cleanup)."""
+    def one(t):
+        try:
+            gh = gh_factory(t.get("pat"))
+            runs = gh.list_completed_runs(repo_of(t)) or []
+            return {"target": t, "label": t.get("label") or repo_of(t),
+                    "repo": repo_of(t), "runs": list(runs), "error": None}
+        except Exception as e:
+            return {"target": t, "label": t.get("label") or repo_of(t),
+                    "repo": repo_of(t), "runs": [], "error": str(e)}
+    if not targets:
+        return []
+    with ThreadPoolExecutor(max_workers=min(8, len(targets))) as ex:
+        return list(ex.map(one, targets))
+
+
+def old_runs_totals(collected):
+    """(grand total, entries that have runs, entries that failed)."""
+    return (sum(len(c["runs"]) for c in collected),
+            [c for c in collected if c["runs"]],
+            [c for c in collected if c.get("error")])
+
+
+def delete_old_runs_all(collected, gh_factory, log):
+    """Delete every run in `collected` — IN PARALLEL across targets
+    and within each target (6 workers each). Logs one line per
+    target as it finishes; returns the (deleted, failed) grand
+    totals. One target's failures never stop the others."""
+    def del_one_target(c):
+        gh = gh_factory(c["target"].get("pat"))
+
+        def one(r):
+            try:
+                return bool(gh.delete_run(c["repo"], r["id"]))
+            except Exception:
+                return False
+
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            results = list(ex.map(one, c["runs"]))
+        ok = sum(results)
+        fail = len(results) - ok
+        log(f"{c['label']}: old runs deleted: {ok}"
+            + (f", FAILED: {fail}" if fail else ""))
+        return ok, fail
+
+    todo = [c for c in collected if c["runs"]]
+    if not todo:
+        return 0, 0
+    with ThreadPoolExecutor(max_workers=min(4, len(todo))) as ex:
+        results = list(ex.map(del_one_target, todo))
+    return (sum(r[0] for r in results), sum(r[1] for r in results))
+
+
+# ---------------------------------------------------------------------------
 # Fleet operations (UI-independent; log is a callable taking a string)
 # ---------------------------------------------------------------------------
 
@@ -1691,7 +1756,7 @@ class App:
         self.btn_rename = ttk.Button(util, text="Rename prefix…", command=self.rename_prefix)
         self.btn_rename.pack(side=tk.LEFT, padx=2)
         ttk.Button(util, text="Connect", command=self.connect_selected).pack(side=tk.LEFT, padx=2)
-        ttk.Button(util, text="🧹 Delete old runs", command=self.delete_old_runs).pack(side=tk.LEFT, padx=2)
+        ttk.Button(util, text="🧹 Delete old runs (all)", command=self.delete_old_runs).pack(side=tk.LEFT, padx=2)
         self.hide_cancelled_var = tk.BooleanVar(
             value=bool(self.settings.get("hide_cancelled")))
         ttk.Checkbutton(util, text="Hide cancelled",
@@ -2303,48 +2368,63 @@ class App:
 
     # -- delete old runs ------------------------------------------------------------
     def delete_old_runs(self):
-        cfg = self.scope_repo()
-        if not cfg:
+        """Clear the completed Actions runs of EVERY configured
+        repo at once — not just the selected repo's (Mehdi's ask).
+        Machines and state are untouched; runs still in progress
+        or queued are kept. One confirmation covers the whole
+        fleet, with the per-repo breakdown."""
+        repos = list(self.settings["repos"])
+        if not repos:
             return
 
         def work():
-            gh = GH(cfg["pat"])
-            runs = gh.list_completed_runs(cfg["repo"])
-            if not runs:
-                self.log(f"{cfg['label']}: no completed runs to delete")
-                return
-            # The confirmation needs the count first, and messagebox
+            collected = fetch_old_runs_all(repos, GH,
+                                           lambda c: c["repo"])
+            # The confirmation needs the counts first, and messagebox
             # must run on the UI thread.
-            self.root.after(0, lambda: self._confirm_delete_runs(cfg, runs))
+            self.root.after(0, lambda: self._confirm_delete_runs(collected))
         self.bg(work)
 
-    def _confirm_delete_runs(self, cfg, runs):
+    def _confirm_delete_runs(self, collected):
+        for c in collected:
+            if c.get("error"):
+                self.log(f"{c['label']}: could not list old runs "
+                         f"({c['error']}) — skipped")
+        total, todo, _failed = old_runs_totals(collected)
+        if not total:
+            self.log("delete old runs: no completed runs to delete "
+                     "in any repo")
+            return
+        breakdown = "\n".join(
+            f"  {c['label']} ({c['repo']}): {len(c['runs'])}"
+            for c in todo)
         if not messagebox.askyesno(
                 "Delete old runs",
-                f"Delete {len(runs)} completed Actions run(s) of "
-                f"{cfg['repo']} from GitHub's history?\n\n"
+                f"Delete {total} completed Actions run(s) from "
+                f"GitHub's history, across ALL {len(todo)} repo(s)?\n\n"
+                f"{breakdown}\n\n"
                 f"Machines and their state are untouched; runs still "
                 f"in progress or queued are kept."):
             return
 
         def work():
-            if not self._acquire_op(f"delete old runs of {cfg['label']}"):
+            if not self._acquire_op(
+                    f"delete old runs (all {len(todo)} repos, "
+                    f"{total} runs)"):
                 return
-            outcome = [f"{cfg['label']}: old runs deleted", True]
+            outcome = [f"delete old runs: {total} run(s) deleted, "
+                       f"all repos", True]
             try:
-                gh = GH(cfg["pat"])
-                done = [0]
-
-                def one(r):
-                    if gh.delete_run(cfg["repo"], r["id"]):
-                        done[0] += 1
-                with ThreadPoolExecutor(max_workers=6) as ex:
-                    list(ex.map(one, runs))
-                self.log(f"{cfg['label']}: deleted {done[0]}/{len(runs)} "
-                         f"completed runs")
-                if done[0] < len(runs):
-                    outcome[:] = [f"{cfg['label']}: run cleanup finished "
-                                  f"with failures — see log", False]
+                ok, fail = delete_old_runs_all(collected, GH, self.log)
+                self.log(f"delete old runs: finished — {ok} deleted"
+                         + (f", {fail} FAILED" if fail else "")
+                         + f" across {len(todo)} repo(s)")
+                if fail:
+                    outcome[:] = [f"delete old runs: {ok} deleted, "
+                                  f"{fail} FAILED — see log", False]
+                else:
+                    outcome[:] = [f"delete old runs: {ok} run(s) "
+                                  f"deleted, all repos", True]
             finally:
                 self._release_op()
                 self._op_done(outcome[0], outcome[1])

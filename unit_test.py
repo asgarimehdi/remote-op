@@ -367,4 +367,40 @@ assert not any(p.startswith("opencode/instances/rey") for p in gh.files)
 assert gh.files["opencode/config/skills/x.md"] == "shared"
 print("rename prefix OK")
 
+# delete old runs — fleet-wide: fetch ALL repos in parallel, one
+# failing repo never blocks the others; totals/breakdown skip the
+# empty ones; the delete covers every repo + counts failures
+class _OldRunsGH:
+    RUNS = {"o/r1": [{"id": 1}, {"id": 2}, {"id": 3}],
+            "o/r2": [],
+            "o/r4": [{"id": 9}]}
+    FAIL_DELETE = {("o/r4", 9)}
+    def __init__(self, pat): self.pat = pat
+    def list_completed_runs(self, repo):
+        if repo == "o/r3":
+            raise RuntimeError("bad token")
+        return list(self.RUNS.get(repo, []))
+    def delete_run(self, repo, rid):
+        return (repo, rid) not in self.FAIL_DELETE
+
+_targets = [{"label": "a1", "repo": "o/r1", "pat": "p1"},
+            {"label": "a2", "repo": "o/r2", "pat": "p2"},
+            {"label": "a3", "repo": "o/r3", "pat": "p3"},
+            {"label": "a4", "repo": "o/r4", "pat": "p4"}]
+_collected = app.fetch_old_runs_all(_targets, _OldRunsGH, lambda c: c["repo"])
+assert [c["label"] for c in _collected] == ["a1", "a2", "a3", "a4"]  # order kept
+_total, _todo, _failed = app.old_runs_totals(_collected)
+assert _total == 4, _total
+assert [c["label"] for c in _todo] == ["a1", "a4"]  # empty a2 omitted
+assert [c["label"] for c in _failed] == ["a3"] and "bad token" in _failed[0]["error"]
+_logs = []
+_ok, _fail = app.delete_old_runs_all(_collected, _OldRunsGH, _logs.append)
+assert (_ok, _fail) == (3, 1), (_ok, _fail)
+assert any(l.startswith("a1: old runs deleted: 3") for l in _logs), _logs
+assert any(l.startswith("a4: old runs deleted: 0") and "FAILED: 1" in l
+           for l in _logs), _logs
+assert app.fetch_old_runs_all([], _OldRunsGH, lambda c: c["repo"]) == []
+assert app.delete_old_runs_all([], _OldRunsGH, _logs.append) == (0, 0)
+print("delete old runs (fleet-wide, all repos) OK")
+
 print("ALL OK")
