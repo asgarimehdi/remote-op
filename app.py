@@ -705,12 +705,12 @@ jobs:
                   cfg = {}
           free_models = {
               "orchestrator": "opencode/deepseek-v4.1-flash-free",
-              "oracle": "opencode/nemotron-3-ultra-free",
+              "oracle": "opencode/nemotron-3.5-lightning-free",
               "explorer": "opencode/glm-5.3-flash-free",
               "fixer": "opencode/deepseek-v4.1-flash-free",
               "librarian": "opencode/glm-5.3-flash-free",
               "designer": "opencode/beam-free",
-              "council": "opencode/nemotron-3-ultra-free",
+              "council": "opencode/nemotron-3.5-lightning-free",
           }
           free_preset = cfg.setdefault("presets", {}).setdefault("free", {})
           for agent, model in free_models.items():
@@ -722,7 +722,7 @@ jobs:
           for stale in ("mimo", "spark"):
               councillors.pop(stale, None)
           for cname, cmodel in (("deepseek", "opencode/deepseek-v4.1-flash-free"),
-                                ("nemotron", "opencode/nemotron-3-ultra-free"),
+                                ("nemotron", "opencode/nemotron-3.5-lightning-free"),
                                 ("glm", "opencode/glm-5.3-flash-free")):
               councillors.setdefault(cname, {})["model"] = cmodel
           cfg["council"].setdefault("default_preset", "default")
