@@ -71,6 +71,10 @@ and the same light theme.
   and moves every state dir, all in one commit. h-dashboard branches
   and old Tailscale entries are NOT renamed. Active runs are
   cancelled first.
+- **Incremental state commits** — bulk create/delete/rename commits
+  are deltas against the head tree — one tree call carrying only the
+  changed paths — so operations stay fast even on repos with
+  thousands of state files.
 - **Connect** — opens a terminal running `opencode --server
   http://<machine>:4096` with that repo's password exported as
   `OPENCODE_SERVER_PASSWORD` (the variable the OpenCode V2 client

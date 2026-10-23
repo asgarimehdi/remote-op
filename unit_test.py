@@ -403,4 +403,42 @@ assert app.fetch_old_runs_all([], _OldRunsGH, lambda c: c["repo"]) == []
 assert app.delete_old_runs_all([], _OldRunsGH, _logs.append) == (0, 0)
 print("delete old runs (fleet-wide, all repos) OK")
 
+# commit_tree_change delta semantics: ONE create_tree call carrying
+# base_tree = the head tree and ONLY the delta entries (deletions as
+# sha None) — never a full-tree rebuild, so repo size does not matter.
+class _DeltaGH(FakeGH):
+    def __init__(self, files):
+        super().__init__(files)
+        self.tree_calls = []   # (entries, base_tree)
+    def create_tree(self, repo, entries, base_tree=None):
+        self.tree_calls.append((list(entries), base_tree))
+        return super().create_tree(repo, entries, base_tree=base_tree)
+
+gh = _DeltaGH({"a.txt": "1", "dir/b.txt": "2", "dir/c.txt": "3"})
+def _mk_entries(blobs):
+    return [{"path": "dir/b.txt", "mode": "100644", "type": "blob", "sha": None},
+            {"path": "new.txt", "mode": "100644", "type": "blob", "sha": "a.txt"}]
+assert gh.commit_tree_change("o/r", "opc", "delta test", _mk_entries, log)
+assert len(gh.tree_calls) == 1 and gh.tree_calls[0][1] == "tree", gh.tree_calls
+assert gh.commits == 1
+assert gh.files == {"a.txt": "1", "dir/c.txt": "3", "new.txt": "1"}, gh.files
+# no-change: build_entries -> [] means True without any tree/commit
+gh = _DeltaGH({"a.txt": "1"})
+assert gh.commit_tree_change("o/r", "opc", "noop", lambda blobs: [], log)
+assert gh.tree_calls == [] and gh.commits == 0
+print("commit_tree_change delta (one create_tree, base_tree) OK")
+
+# scale: 5,000 files in 500 directories — deleting 3 files is still
+# ONE create_tree call with exactly the 3 deletion entries.
+gh = _DeltaGH({f"opencode/instances/wf{i % 25}/sessions/d{i}/f{j}.md": "x"
+               for i in range(500) for j in range(10)})
+assert len(gh.files) == 5000
+def _del3(blobs):
+    return [{"path": f"opencode/instances/wf0/sessions/d0/f{j}.md",
+             "mode": "100644", "type": "blob", "sha": None} for j in range(3)]
+assert gh.commit_tree_change("o/r", "opc", "del 3 of 5000", _del3, log)
+assert len(gh.tree_calls) == 1 and gh.commits == 1
+assert len(gh.tree_calls[0][0]) == 3 and len(gh.files) == 4997
+print("commit_tree_change scale (5000 entries -> 1 create_tree) OK")
+
 print("ALL OK")
