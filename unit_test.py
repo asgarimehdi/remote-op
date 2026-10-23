@@ -285,6 +285,34 @@ out = app.renamed_workflow(t, "rey7")
 assert app.workflow_instance(out) == "rey7"
 print("embedded template render OK")
 
+# --- fork beta sync in step 7 of the embedded template -------------------
+# A machine must not boot stale code: step 7 mirrors upstream
+# (asgarimehdi/h-dashboard) beta onto the account's fork BEFORE
+# branching, with a loud upstream/beta fallback when the push to the
+# fork fails, and a skip when REPO_ORIGIN already IS upstream.
+for _wf, _repo, _owner in (("syd1", "haileen5/my-opencode", "haileen5"),
+                           ("rey1", "Shabakebehdasht/my-opencode",
+                            "Shabakebehdasht"),
+                           ("sad1", "hailyn3/my-op-sad", "hailyn3"),
+                           ("sin1", "nashenas6/my-opencode", "nashenas6")):
+    t = app.embedded_template(_wf, _repo)
+    # the fleet's identity fields still render correctly
+    assert f"REPO_ORIGIN: https://github.com/{_owner}/h-dashboard.git" in t
+    assert f'git config user.name "{_owner}"' in t
+    # the sync block: upstream + skip guard + mirror push + fallback
+    assert 'UPSTREAM_REPO="https://github.com/asgarimehdi/h-dashboard.git"' in t
+    assert 'if [ "$REPO_ORIGIN" = "$UPSTREAM_REPO" ]' in t
+    assert "git fetch upstream beta" in t
+    assert "git checkout -B beta upstream/beta" in t
+    assert "git push origin beta" in t
+    assert 'BASE_REF="upstream/beta"' in t
+    # position: after the origin/beta fetch, before the WF checkout;
+    # the old branch-straight-from-stale-origin/beta line is gone
+    assert t.index("git fetch origin beta") < t.index("UPSTREAM_REPO=") \
+        < t.index('git checkout -B "${WF_NAME}" "$BASE_REF"')
+    assert 'git checkout -B "${WF_NAME}" origin/beta' not in t
+print("fork beta sync (template, all four fleets) OK")
+
 # --- bulk delete: checked machines, one commit, config untouched --------------
 files = {}
 for n in (1, 2, 3):

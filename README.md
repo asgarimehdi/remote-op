@@ -75,6 +75,13 @@ and the same light theme.
   are deltas against the head tree — one tree call carrying only the
   changed paths — so operations stay fast even on repos with
   thousands of state files.
+- **Fork beta sync (boot workflow)** — before branching, a machine's
+  step 7 mirrors its account fork's `beta` from upstream
+  `asgarimehdi/h-dashboard` beta and only then creates its branch
+  from the freshly synced `origin/beta`, so machines no longer boot
+  stale code. If the push to the fork fails, the boot does not die
+  and does not silently keep the stale beta either: it warns loudly
+  and branches from `upstream/beta` for that run.
 - **Connect** — opens a terminal running `opencode --server
   http://<machine>:4096` with that repo's password exported as
   `OPENCODE_SERVER_PASSWORD` (the variable the OpenCode V2 client

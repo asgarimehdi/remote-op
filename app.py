@@ -314,9 +314,39 @@ jobs:
           # Fetch latest origin/beta
           git fetch origin beta
 
-          # Create / reset WF_NAME branch from origin/beta
-          git checkout -B "${WF_NAME}" origin/beta
-          echo "✅ Branch ${WF_NAME} created/reset from origin/beta"
+          # Sync the fork's beta from upstream (asgarimehdi/h-dashboard)
+          # BEFORE branching: this fork's beta usually lags upstream, so
+          # branching from origin/beta alone would boot stale code. Mirror
+          # upstream/beta onto the fork, then branch from the freshly
+          # synced origin/beta. If the push to the fork fails (e.g. this
+          # token cannot push there), do NOT fail the boot and do NOT
+          # silently keep the stale beta either: warn loudly and branch
+          # from upstream/beta for this run instead.
+          UPSTREAM_REPO="https://github.com/asgarimehdi/h-dashboard.git"
+          BASE_REF="origin/beta"
+          if [ "$REPO_ORIGIN" = "$UPSTREAM_REPO" ]; then
+            echo "ℹ️ REPO_ORIGIN is upstream itself — fork beta sync skipped"
+          else
+            git remote get-url upstream >/dev/null 2>&1 \
+              || git remote add upstream "$UPSTREAM_REPO"
+            if git fetch upstream beta; then
+              git checkout -B beta upstream/beta
+              git remote set-url origin "$(printf '%s' "$REPO_ORIGIN" | sed "s#^https://#https://x-access-token:${GH_TOKEN}@#")"
+              if git push origin beta; then
+                git fetch origin beta
+                echo "✅ Fork beta synced from upstream asgarimehdi/h-dashboard"
+              else
+                echo "⚠️⚠️ WARNING: could not push the synced beta to the fork — branching from upstream/beta for this run; the fork's beta stays stale"
+                BASE_REF="upstream/beta"
+              fi
+            else
+              echo "⚠️⚠️ WARNING: could not fetch upstream beta — branching from origin/beta (possibly stale) for this run"
+            fi
+          fi
+
+          # Create / reset WF_NAME branch from the synced beta
+          git checkout -B "${WF_NAME}" "$BASE_REF"
+          echo "✅ Branch ${WF_NAME} created/reset from $BASE_REF"
 
           cp .env.example.pgsql .env
 
