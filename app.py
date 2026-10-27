@@ -419,7 +419,7 @@ jobs:
       - name: 11. Install 9router globally and create symlink
         run: |
           # wreq-js is installed before 9router.
-          npm install wreq-js
+          npm install -g wreq-js
           npm install -g 9router
           if [ -f ~/.npm-global/bin/9router ]; then
             sudo ln -sf ~/.npm-global/bin/9router /usr/local/bin/9router
