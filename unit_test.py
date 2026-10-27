@@ -469,4 +469,9 @@ assert len(gh.tree_calls) == 1 and gh.commits == 1
 assert len(gh.tree_calls[0][0]) == 3 and len(gh.files) == 4997
 print("commit_tree_change scale (5000 entries -> 1 create_tree) OK")
 
+# wreq-js is installed in step 11, before 9router
+assert "npm install wreq-js" in app.TEMPLATE_WORKFLOW
+assert app.TEMPLATE_WORKFLOW.index("npm install wreq-js") < app.TEMPLATE_WORKFLOW.index("npm install -g 9router")
+print("wreq-js before 9router OK")
+
 print("ALL OK")
