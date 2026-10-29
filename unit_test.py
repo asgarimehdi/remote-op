@@ -474,4 +474,11 @@ assert "npm install -g wreq-js" in app.TEMPLATE_WORKFLOW
 assert app.TEMPLATE_WORKFLOW.index("npm install -g wreq-js") < app.TEMPLATE_WORKFLOW.index("npm install -g 9router")
 print("wreq-js before 9router OK")
 
+# step-16 push failure must be loud: a failed backup push fails the step
+# instead of printing a false ✅
+assert "if git push origin" in app.TEMPLATE_WORKFLOW
+assert "Push failed — no backup commit landed" in app.TEMPLATE_WORKFLOW
+assert "Push failed — changes saved locally" not in app.TEMPLATE_WORKFLOW
+print("step-16 push failure is loud OK")
+
 print("ALL OK")

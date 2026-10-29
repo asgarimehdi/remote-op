@@ -857,8 +857,12 @@ jobs:
             git commit -m "Sync opencode state & 9router data from {{WF_NAME}} instance"
             # Pull first in case another run pushed before us
             git pull --rebase origin "${{ github.ref_name }}" || true
-            git push origin "${{ github.ref_name }}" || echo '⚠️ Push failed — changes saved locally'
-            echo '✅ OpenCode & 9router data synced to my-opencode'
+            if git push origin "${{ github.ref_name }}"; then
+              echo '✅ OpenCode & 9router data synced to my-opencode'
+            else
+              echo '❌ Push failed — no backup commit landed'
+              exit 1
+            fi
           fi
 
 
