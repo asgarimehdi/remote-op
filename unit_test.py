@@ -278,7 +278,7 @@ assert "{{REPO}}" not in text
 assert app.workflow_instance(gh.files[".github/workflows/syd2.yml"]) == "syd2"
 print("bulk create on brand-new repo (embedded template) OK")
 
-# default prefix when none is hinted; copy mode is retired (raw)
+# default prefix when none is hinted; copy mode degrades to raw there
 gh = FakeGH({})
 created = app.create_instances(gh, CFG, 1, log, mode="copy")
 assert created == ["op1"], created
@@ -292,7 +292,7 @@ assert "https://github.com/Shabakebehdasht/h-dashboard.git" in t
 assert app.workflow_timeout(t) == 340
 out = app.renamed_workflow(t, "rey7")
 assert app.workflow_instance(out) == "rey7"
-# renamed_workflow on the fresh-boot template (no sync-back commit
+# renamed_workflow on the template without the sync-back step (no commit
 # message marker any more) — the two identity spots are enough
 t_new = app.embedded_template("syd1", "haileen5/my-opencode")
 assert "from syd1 instance" not in t_new
@@ -351,9 +351,7 @@ assert "opencode/instances/rey2/db.sqlite" in gh.files
 assert ".github/workflows/rey1.yml" not in gh.files
 print("bulk delete skip-on-stuck-run OK")
 
-# --- create with COPY mode: retired — no state is ever copied -----------
-# The no-backup template restores nothing, so state copied into a new
-# instance would be dead weight. Copy behaves exactly like raw.
+# --- create with COPY mode: state cloned from the first machine ------------------
 files = {".github/workflows/rey1.yml": SAMPLE,
          "opencode/instances/rey1/data/opencode.db": "sessions+history",
          "opencode/instances/rey1/data/shell/x/out.txt": "shell log",
@@ -363,30 +361,32 @@ files = {".github/workflows/rey1.yml": SAMPLE,
 gh = FakeGH(files)
 created = app.create_instances(gh, CFG, 1, log, mode="copy")
 assert created == ["rey2"], created
-assert gh.commits == 1, gh.commits  # workflow file only, ONE commit
-assert not any(p.startswith("opencode/instances/rey2") for p in gh.files)
-# the template's own leftover state is untouched, config untouched
+assert gh.commits == 1, gh.commits  # workflows + state in ONE commit
+assert gh.files["opencode/instances/rey2/data/opencode.db"] == "sessions+history"
+assert gh.files["opencode/instances/rey2/cbm-cache/h-dashboard.db"] == "cbm index"
+assert gh.files["opencode/instances/rey2/9router.sqlite"] == "9router db"
+assert gh.files["opencode/instances/rey2/data/shell/x/out.txt"] == "shell log"
+# the template's own state is untouched, config untouched
 assert gh.files["opencode/instances/rey1/data/opencode.db"] == "sessions+history"
 assert gh.files["opencode/config/skills/x.md"] == "shared"
-print("create copy mode retired (no state copied) OK")
+print("create copy mode (state cloned, one commit) OK")
 
-# bulk create with copy mode: workflows only, still one commit
+# bulk copy: every new machine gets the template's state
 gh = FakeGH(files)
 created = app.create_instances(gh, CFG, 3, log, mode="copy")
 assert created == ["rey2", "rey3", "rey4"], created
-assert not any(p.startswith("opencode/instances/rey2") for p in gh.files)
-assert not any(p.startswith("opencode/instances/rey3") for p in gh.files)
-assert not any(p.startswith("opencode/instances/rey4") for p in gh.files)
+for n in ("rey2", "rey3", "rey4"):
+    assert gh.files[f"opencode/instances/{n}/9router.sqlite"] == "9router db"
 assert gh.commits == 1
-print("bulk create copy mode retired OK")
+print("bulk create copy mode OK")
 
-# copy mode with NO backed-up state: same result (no state copied)
+# copy mode with NO backed-up state degrades to raw, still one commit
 gh = FakeGH({".github/workflows/rey1.yml": SAMPLE})
 created = app.create_instances(gh, CFG, 1, log, mode="copy")
 assert created == ["rey2"], created
 assert not any(p.startswith("opencode/instances/") for p in gh.files)
 assert gh.commits == 1
-print("copy mode without state OK")
+print("copy mode without state -> raw fallback OK")
 
 # raw mode (default) never copies state
 gh = FakeGH(files)
@@ -516,20 +516,22 @@ plan = app.plan_update(gh, CFG, log, only_wfs={"rey2"})
 assert plan["changed"] == [] and plan["unchanged"] == ["rey2"]
 print("update workflows (checked/all, one commit, idempotent) OK")
 
-# fresh boot template: no restore, no sync-back, OPENCODE_API_KEY auth
+# backup-taking cancelled: only the sync-back step is gone.
+# Restores (step 12 9router db, step 13 OpenCode state) are untouched,
+# 9router settings are untouched, and there is NO OPENCODE_API_KEY
+# anywhere in the template.
 _t = app.embedded_template("syd1", "haileen5/my-opencode")
 assert _t.startswith("# Managed by Remote-Op")
 assert "Sync opencode state" not in _t
-assert "Restore 9router" not in _t and "Restore the OpenCode backup" not in _t
-assert "opencode/instances/${WF_NAME}" not in _t
-assert "9router.sqlite" not in _t
-assert "OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY || vars.OPENCODE_API_KEY }}" in _t
-assert "OPENCODE_API_KEY is empty" in _t
-assert "Console smoke check" in _t and "opencode.ai/inference/openai/v1/models" in _t
-assert "Dropped stale 9router baseURL" in _t
-assert "12. Start 9router hidden (tray)" in _t
+assert "OPENCODE_API_KEY" not in _t
+assert "Console smoke check" not in _t
+assert "Dropped stale 9router baseURL" not in _t
+assert "12. Restore 9router db backup" in _t
+assert "Restore the OpenCode backup" in _t
+assert "9router.sqlite" in _t
+assert "13. Install OpenCode V2, restore state" in _t
 assert "16. Tailscale Logout" in _t and "17. Tailscale" not in _t
 assert "git push origin" in _t  # fork-beta sync in step 7 stays
-print("fresh-boot template (no backup, key auth) OK")
+print("backup-cancelled template (restore + 9router untouched) OK")
 
 print("ALL OK")

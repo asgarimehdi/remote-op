@@ -9,12 +9,9 @@ checked / Stop checked), an operation indicator with a serialized op
 lock, parallel + progressive loading, and the RemoteHermes light theme.
 
 Each configured repo holds one workflow file per OpenCode instance
-(op1/open2, rey1..rey11 style). FRESH BOOT: no state is read from or
-written back to the repo — every boot rebuilds OpenCode from scratch
-and sessions die with the runner. Leftover opencode/instances/<wf>/
-dirs from before the no-backup change are never read again; Delete
-checked removes them, and the shared opencode/config is NEVER touched
-by this app. Instances are told apart only by their WF_NAME (the
+(op1/open2, rey1..rey11 style): state lives per instance under
+opencode/instances/<wf>/, the shared opencode/config is NEVER touched
+by this app, and instances are told apart only by their WF_NAME (the
 WF_NAME inside the file is authoritative — file names have varied,
 e.g. op1.yml hosts open1).
 
@@ -22,21 +19,18 @@ Fleet operations added on the Hermes basis:
 
   * Delete checked — tick any machines (across repos) and delete them
     all: active runs are cancelled and awaited first, then, per repo,
-    the workflow files + every leftover instance state dir go in ONE
-    commit.
+    the workflow files + every instance's state go in ONE commit.
   * Update checked / Update all — re-render every workflow file from
     the canonical template embedded in the app (one delta commit per
     repo, only files that actually change). Takes effect on the next
     dispatch; running jobs keep the old form.
   * Create N from first machine — give a number (e.g. 10) and that
     many new instances are cloned from the repo's first (lowest-
-    numbered) machine's workflow file, gap-filling the numbering, in
-    ONE commit. Every new machine boots fresh (no state is copied:
-    the workflow restores nothing). With no machine left, the
-    template is recovered from git history, as before; in a
-    brand-new raw repo (no machine ever, no history) the first
-    machines are bootstrapped from the canonical workflow template
-    embedded in the app, rendered for that repo.
+    numbered) machine, gap-filling the numbering, in ONE commit.
+    With no machine left, the template is recovered from git history,
+    as before; in a brand-new raw repo (no machine ever, no history)
+    the first machines are bootstrapped from the canonical workflow
+    template embedded in the app, rendered for that repo.
 
 Each repo may carry its own PAT; a repo without one falls back to the
 token of the locally logged-in gh CLI account. The per-repo OpenCode
@@ -151,8 +145,8 @@ def renamed_workflow(text, new_name):
     prefix works. Two spots carry the identity: the workflow `name:`
     and the WF_NAME job env. A third spot — the old sync-back step's
     commit message ("from <old> instance") — is rewritten too when
-    present (legacy files from before the no-backup template); the
-    fresh-boot template has no sync-back step, so it is optional.
+    present (legacy files from before the sync-back removal); the
+    template without a sync-back step has none, so it is optional.
     Raises ValueError if a required marker is missing.
     """
     old_name = workflow_instance(text)
@@ -171,18 +165,18 @@ def renamed_workflow(text, new_name):
 # ---------------------------------------------------------------------------
 # Canonical workflow template (embedded)
 # ---------------------------------------------------------------------------
-# The canonical my-opencode workflow, with the account-specific
-# spots as placeholders: {{WF_NAME}} the instance name, {{OWNER}} the
-# repo owner (git identity + the owner's own h-dashboard repo),
-# {{REPO}} the full repo slug. FRESH BOOT (2026-11-01, Mehdi's ask):
-# no state is read from or written back to the repo — no restore, no
-# sync-back, no backup of any kind. Every boot rebuilds OpenCode from
-# scratch (§4/§4b/§4c); sessions, indexes and runtime-added servers
-# die with the runner. The OpenCode Console key comes from the repo's
-# OPENCODE_API_KEY Secret (Variable fallback), set manually per repo —
-# never from a backup. Update re-renders every live workflow file
-# from this template, so manual edits to a workflow file are
-# overwritten on the next Update.
+# The current live my-opencode workflow (taken from haileen5's syd1 on
+# 2026-10-20, byte-identical to Shabakebehdasht's rey1 except the
+# identity spots) with the account-specific spots as placeholders:
+# {{WF_NAME}} the instance name, {{OWNER}} the repo owner (git identity
+# + the owner's own h-dashboard repo), {{REPO}} the full repo slug
+# (sync-back remote). A brand-new raw repo — no machine, no git
+# history — is bootstrapped from this; every other create clones a
+# real machine instead, so a fleet's own drift always wins over this
+# snapshot. Keep it in step with the live fleets when their workflow
+# changes materially.
+# Update re-renders every live workflow file from this template;
+# manual edits to a workflow file are overwritten on the next Update.
 TEMPLATE_WORKFLOW = r'''# Managed by Remote-Op — re-rendered from the embedded template on Update; manual edits are overwritten
 name: {{WF_NAME}}
 on:
@@ -444,14 +438,22 @@ jobs:
             echo '⚠️ 9router binary not found after installation'
           fi
 
-      - name: 12. Start 9router hidden (tray) — fresh, no restore
+      - name: 12. Restore 9router db backup & start hidden (tray)
         run: |
           export INITIAL_PASSWORD="${{ secrets.RUNNER_PASSWORD }}"
-          # Make sure the data dir exists. FRESH BOOT: 9router always
-          # starts with an empty database — nothing is restored from
-          # the repo and nothing is synced back. Each machine's
-          # 9router state lives and dies with its runner.
+          # Make sure the data dir exists
           mkdir -p ~/.9router/db
+          BACKUP_DIR="${GITHUB_WORKSPACE:-.}/opencode/instances/${WF_NAME}"
+          # Restore THIS instance's backed-up 9router state. State is
+          # per-instance under opencode/instances/<wf>/ (data,
+          # cbm-cache, 9router db) so the four workflows never
+          # overwrite each other; only opencode/config stays shared.
+          if [ -f "$BACKUP_DIR/9router.sqlite" ]; then
+            cp "$BACKUP_DIR/9router.sqlite" ~/.9router/db/data.sqlite
+            echo '✅ Restored 9router data.sqlite from repo backup'
+          else
+            echo '⚠️ per-instance 9router.sqlite not found in repo — starting fresh'
+          fi
           # Start 9router hidden in the background (tray mode) on the default port 20128.
           # --tray is the same "hide to background" option used interactively.
           nohup 9router --tray --skip-update -p 20128 > /tmp/9router.log 2>&1 &
@@ -463,34 +465,12 @@ jobs:
           fi
 
 
-      - name: 13. Install OpenCode V2, configure MCPs + Superpowers plugin & start serve
+      - name: 13. Install OpenCode V2, restore state, configure MCPs + Superpowers plugin & start serve
         env:
-          # Auth for the built-in `opencode` provider (Console / Zen free
-          # models): models.dev lists OPENCODE_API_KEY as this provider's
-          # env var, and OpenCode resolves it at request time — no
-          # `opencode auth login` and no key in any file. Secret wins;
-          # the repository Variable is only a fallback (a Variable value
-          # is NOT masked in logs and is readable via the API — prefer
-          # the Secret). Never echo this variable.
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY || vars.OPENCODE_API_KEY }}
           OPENCODE_SERVER_PASSWORD: ${{ secrets.RUNNER_PASSWORD }}
           OPENCODE_DISABLE_AUTOUPDATE: "true"
           GH_TOKEN: ${{ secrets.MY_PAT }}
         run: |
-          # 0. Fail FAST when no Console key is configured: without it the
-          #    serve process boots but every model call fails, and the
-          #    run then idles for the full keep-alive. The key is a
-          #    service-account key from Settings > Service accounts in
-          #    the OpenCode Console — set it as the repository Secret
-          #    OPENCODE_API_KEY (or, less safely, the Variable of the
-          #    same name). Only emptiness is checked here; the value is
-          #    never printed.
-          if [ -z "${OPENCODE_API_KEY:-}" ]; then
-            echo '❌ OPENCODE_API_KEY is empty — set the repository Secret OPENCODE_API_KEY (service-account key from the OpenCode Console) and re-run'
-            exit 1
-          fi
-          echo '✅ OPENCODE_API_KEY is set (value not shown)'
-
           # 1. Install OpenCode V2 — npm package @opencode/cli (the v1
           #    package opencode-ai stays on the 1.x line forever). Same
           #    npm-global pattern as CodeGraph/9router, plus the
@@ -510,8 +490,7 @@ jobs:
           #     GitHub releases): the fifth MCP server, ensured in §4. Its
           #     own OpenCode extras (skill, agents, plugin, instructions)
           #     are installed in §4b, and its index cache
-          #     (~/.cache/codebase-memory-mcp) starts empty on every
-          #     fresh boot — no restore, no sync-back.
+          #     (~/.cache/codebase-memory-mcp) is restored in §2.
           #     The binary MUST live in a user-owned dir
           #     ($HOME/.local/bin, no sudo): the `install -y` in §4b
           #     runs an activation transaction that refuses to
@@ -529,20 +508,36 @@ jobs:
             echo "✅ codebase-memory-mcp installed: $("$HOME/.local/bin/codebase-memory-mcp" --version)"
           fi
 
-          # 2. FRESH BOOT — nothing is restored. There is no
-          #    opencode/ backup in this repo by design: every run
-          #    rebuilds ~/.config/opencode from scratch in §4/§4b/§4c
-          #    below, sessions start empty, and the codebase-memory
-          #    index cache starts empty. (The only repo-side config
-          #    read is opencode/default-models.txt, in §4.)
+          # 2. Restore the OpenCode backup from the repo (opencode/ dir).
+          #    config/ is SHARED by all four
+          #    instances (opencode.json, plugins, agents and skills —
+          #    skills stay shared on purpose), while data and the
+          #    codebase-memory index cache are PER-INSTANCE under
+          #    instances/<wf>/, so instances never clobber each other.
+          OC="${GITHUB_WORKSPACE:-.}/opencode"
+          OCI="$OC/instances/${WF_NAME}"
+          if [ -d "$OC/config" ]; then
+            mkdir -p ~/.config/opencode
+            cp -r "$OC/config/." ~/.config/opencode/
+            echo '✅ Restored OpenCode config from repo backup'
+          fi
+          if [ -d "$OCI/data" ]; then
+            mkdir -p ~/.local/share/opencode
+            cp -r "$OCI/data/." ~/.local/share/opencode/
+            echo '✅ Restored OpenCode data (sessions/db) from the per-instance backup'
+          fi
+          if [ -d "$OCI/cbm-cache" ]; then
+            mkdir -p ~/.cache/codebase-memory-mcp
+            cp -r "$OCI/cbm-cache/." ~/.cache/codebase-memory-mcp/
+            echo '✅ Restored codebase-memory-mcp index cache from the per-instance backup'
+          fi
 
           # 3. Prepare the MCP environment. OpenCode does NOT inherit gh's
           #    login: every MCP server is a separate process that reads only
           #    its own env vars. So the GitHub token (same MY_PAT gh uses)
           #    is exported here — opencode serve below inherits it, and
           #    the config in §4 references it as
-          #    {env:...}, so NO secret lands in opencode.json (which is
-          #    never committed anywhere — this fleet keeps no backup).
+          #    {env:...}, so NO secret lands in opencode.json.
           #    Persisted to ~/.bashrc as well, for
           #    shells opened later over SSH.
           export GITHUB_PERSONAL_ACCESS_TOKEN="$GH_TOKEN"
@@ -567,10 +562,7 @@ jobs:
           #    codebase-memory-mcp), DROPS postgis for good (removed at
           #    Mehdi's request), and
           #    PRESERVES any other server already in the config — the
-          #    mcp block is merged, never rewritten whole, so the step
-          #    stays idempotent. (Fresh boot: the config starts empty
-          #    every run, so servers added at runtime in a previous run
-          #    do NOT survive — only §4/§4b/§4c survive.)
+          #    mcp block is merged, never rewritten whole.
           #    It also ensures the Superpowers plugin: V2 reads the
           #    `plugins` array; the V1 `plugin` key is mirrored with the
           #    same spec so a rollback to V1 would keep the plugin too.
@@ -589,29 +581,6 @@ jobs:
               except Exception:
                   cfg = {}
           cfg.setdefault("$schema", "https://opencode.ai/config.json")
-          # Auth note: NO provider block is written for `opencode`. The
-          # built-in provider already points at the Console inference
-          # endpoint and reads OPENCODE_API_KEY from the serve
-          # process environment (models.dev: env OPENCODE_API_KEY,
-          # api https://opencode.ai/inference/openai/v1). Writing a
-          # V1-style provider.options.apiKey block would be ignored
-          # at best on V2, and a literal key here would land in the
-          # config file. Only sanitize: drop a stale
-          # baseURL that points at the removed local 9router proxy,
-          # so a stale config can never route models to a
-          # port nothing listens on any more.
-          for _pkey in ("provider", "providers"):
-              _prov = cfg.get(_pkey, {})
-              if isinstance(_prov, dict):
-                  _oc = _prov.get("opencode")
-                  if isinstance(_oc, dict):
-                      _opts = _oc.get("options", _oc.get("settings", {}))
-                      if isinstance(_opts, dict):
-                          _bu = str(_opts.get("baseURL", _opts.get("base_url", "")))
-                          if "20128" in _bu or "9router" in _bu or "127.0.0.1" in _bu or "localhost" in _bu:
-                              _opts.pop("baseURL", None)
-                              _opts.pop("base_url", None)
-                              print("🧹 Dropped stale 9router baseURL from opencode config")
           # Autoupdate stays OFF: the runner is ephemeral, so an
           # /update could never persist, and the update banner
           # only adds noise when a release lands mid-run.
@@ -714,14 +683,14 @@ jobs:
           # 4b. codebase-memory-mcp's own OpenCode integration: its skill
           #     (~/.config/opencode/skills/codebase-memory), three read-only
           #     agents, the cbm-augment plugin and AGENTS.md instructions.
-          #     Everything lands under ~/.config/opencode and is rebuilt
-          #     fresh on every boot (no backup). Two installer quirks shape
+          #     Everything lands under ~/.config/opencode (restored in §2).
+          #     Two installer quirks shape
           #     this loop: (1) it aborts instantly when its binary is
           #     root-owned ("install_dir_not_owned_by_you") — hence the
           #     user-owned copy from §1b; with the old root-owned
           #     /usr/local/bin copy this step silently wrote NOTHING for
           #     the whole lifetime of these workflows, which is why the
-          #     extras were never installed; (2) its config-write ops
+          #     extras never reached the backup; (2) its config-write ops
           #     race each other and a random subset fails per run
           #     ("target: does not exist or cannot be inspected" — root
           #     runs mask it, mode bits do not bind root), so --force is
@@ -747,8 +716,7 @@ jobs:
           fi
 
           # 4c. oh-my-opencode-slim: write/merge its config
-          #     (~/.config/opencode/oh-my-opencode-slim.json, rebuilt
-          #     fresh on every boot) with a "free" preset
+          #     (~/.config/opencode/oh-my-opencode-slim.json) with a "free" preset
           #     that puts EVERY agent on a free OpenCode Zen model, plus
           #     free councillors for the Council agent. The merge
           #     preserves any other presets/settings already present, and
@@ -814,19 +782,6 @@ jobs:
             echo '✅ opencode serve is live on http://localhost:4096 (basic auth: opencode / RUNNER_PASSWORD)'
           else
             echo '⚠️ opencode serve did not come up — check /tmp/opencode.log'
-          fi
-
-          # 5b. Advisory Console smoke check: does this key authenticate
-          #     against the Inference API models endpoint? Advisory
-          #     ONLY — a non-200 here does not stop the run (the header
-          #     contract could differ by key kind), but a 200 here
-          #     proves key + endpoint before the keep-alive starts.
-          #     Only the HTTP code is printed; the key never is.
-          _smoke=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${OPENCODE_API_KEY}" https://opencode.ai/inference/openai/v1/models || echo '000')
-          if [ "$_smoke" = "200" ]; then
-            echo '✅ Console smoke check: Inference API models endpoint answered 200 with OPENCODE_API_KEY'
-          else
-            echo "⚠️ Console smoke check: Inference API models endpoint answered HTTP ${_smoke} — the web UI may still work; check the key kind/permissions in the Console if model calls fail"
           fi
 
       - name: 14. Start Laravel Development Server
@@ -1396,15 +1351,21 @@ def create_instances(gh, cfg, count, log, mode="raw", prefix_hint=None):
     git-tree commit. Returns the created instance names ([] when
     nothing was created).
 
-    mode="copy" is accepted for older callers but behaves exactly
-    like "raw": NO state is ever copied. The no-backup template
-    restores nothing, so state copied into a new instance would be
-    dead weight in the repo. (Plugins, skills, agents and MCP
-    config need no copying: they are rebuilt by the workflow's
-    §4/§4b/§4c on every boot.)
+    mode="copy" also clones the template's backed-up per-instance
+    state — every blob under opencode/instances/<template>/ (data/:
+    sessions & history, cbm-cache/: the codebase-memory index, and
+    9router.sqlite when present) — into each new instance's state
+    dir, reusing the same blob SHAs in the same single commit, so the
+    new machine boots fully warm instead of raw. (Plugins, skills,
+    agents and MCP config need no copying: they live in the SHARED
+    opencode/config every instance already uses.) When the template
+    has no backed-up state, copy degrades to raw with a log line.
+    mode="raw" is the old behaviour: clean state, created by the
+    instance's own first sync.
     """
     repo, branch = cfg["repo"], cfg["branch"]
     inst = gh.list_instances(repo, branch)
+    embedded = False
     if inst:
         template_name = sorted(
             inst, key=lambda n: parse_instance_name(n)[1])[0]
@@ -1422,12 +1383,13 @@ def create_instances(gh, cfg, count, log, mode="raw", prefix_hint=None):
             # there is nothing to clone and nothing in history either.
             # Bootstrap from the canonical workflow embedded in the
             # app, rendered for THIS repo (owner/slug), instead of
-            # dead-ending. The machines boot fresh — the workflow
-            # restores nothing, so there is no state to copy.
+            # dead-ending. The machines start raw — a new repo has no
+            # backed-up state anywhere to copy.
             pfx = prefix_hint if prefix_hint and valid_prefix(
                 prefix_hint) else "op"
             template_name = f"{pfx}1"
             template_text = embedded_template(template_name, repo)
+            embedded = True
             log(f"repo is brand-new (no machines, none in git history) "
                 f"— bootstrapping from the workflow template embedded "
                 f"in Remote-Op, prefix '{pfx}' (change it later with "
@@ -1456,28 +1418,63 @@ def create_instances(gh, cfg, count, log, mode="raw", prefix_hint=None):
         log("create aborted: a blob upload FAILED (nothing committed)")
         return []
 
-    # No state is copied, ever (see the docstring): the workflow
-    # restores nothing, so cloning the template's leftover
-    # opencode/instances/ blobs would only bloat the repo. "copy"
-    # from an older caller degrades to fresh with a log line.
-    if mode == "copy":
-        log("copy mode is retired — no state is backed up any more, "
-            "so every new machine boots fresh (no state copied)")
+    # Copy mode: snapshot the template's state entries ONCE (path,
+    # mode, blob sha). The commit below re-points those same blobs at
+    # each new instance's dir — nothing is re-uploaded, however large
+    # the state is.
+    src_state = []
+    if mode == "copy" and embedded:
+        log("copy mode: a brand-new repo has no backed-up state to "
+            "copy — creating raw (first sync creates the state)")
+    elif mode == "copy":
+        head = gh.ref_head(repo, branch)
+        if head:
+            prefix = f"opencode/instances/{template_name}/"
+            src_state = [e for e in gh.recursive_tree(repo, head)
+                         if e.get("type") == "blob"
+                         and e["path"].startswith(prefix)]
+        if src_state:
+            log(f"copy mode: cloning {template_name}'s backed-up state "
+                f"({len(src_state)} file(s): sessions/history, "
+                f"codebase-memory index, 9router db if present) into "
+                f"each new machine")
+        else:
+            log(f"copy mode: {template_name} has NO backed-up state "
+                f"under opencode/instances/{template_name}/ — creating "
+                f"raw instead (it never synced, or its state is gone)")
 
     def entries(_blobs):
-        return [{"path": f".github/workflows/{name}.yml", "mode": "100644",
-                 "type": "blob", "sha": blob_sha[name]} for name in names]
+        out = [{"path": f".github/workflows/{name}.yml", "mode": "100644",
+                "type": "blob", "sha": blob_sha[name]} for name in names]
+        if src_state:
+            src_prefix = f"opencode/instances/{template_name}/"
+            for name in names:
+                for e in src_state:
+                    out.append({
+                        "path": f"opencode/instances/{name}/"
+                                + e["path"][len(src_prefix):],
+                        "mode": e["mode"], "type": "blob",
+                        "sha": e["sha"]})
+        return out
 
     msg = (f"Add {names[0]} workflow" if count == 1 else
            f"Add {count} instances from {template_name}: "
            f"{names[0]}..{names[-1]}")
+    if src_state:
+        msg += f" (state copied from {template_name})"
     if not gh.commit_tree_change(repo, branch, msg, entries, log):
         log("create FAILED — no instances were committed")
         return []
     for name in names:
-        log(f"✅ Created .github/workflows/{name}.yml — {name} "
-            f"boots fresh: no state is restored from or synced back "
-            f"to GitHub")
+        if src_state:
+            log(f"✅ Created .github/workflows/{name}.yml + a full copy "
+                f"of {template_name}'s state in opencode/instances/"
+                f"{name}/ ({len(src_state)} file(s)) — {name} boots "
+                f"warm, with {template_name}'s history")
+        else:
+            log(f"✅ Created .github/workflows/{name}.yml — {name} "
+                f"starts with a clean state and creates "
+                f"opencode/instances/{name}/ on its first sync")
     return names
 
 
@@ -1658,7 +1655,7 @@ def apply_update(gh, cfg, plan, log):
 
     names = ", ".join(wf for wf, _f, _r in changed)
     msg = (f"Update {names} workflow(s) from the Remote-Op embedded "
-           f"template (fresh boot: no backup; OPENCODE_API_KEY auth)")
+           f"template (backup sync-back step removed)")
     if not gh.commit_tree_change(repo, branch, msg, entries, log):
         log("update FAILED — the commit did not land")
         return False
@@ -2577,12 +2574,11 @@ class App:
                 f"template embedded in Remote-Op?\n\n{detail}\n\n"
                 f"One commit per repo, only the files that change. "
                 f"Manual edits to those files are overwritten.\n\n"
-                f"After Update every boot is FRESH: no state is "
-                f"restored from or synced back to GitHub, and the "
-                f"OpenCode key must be the repo's OPENCODE_API_KEY "
-                f"Secret (set it manually per repo in GitHub "
-                f"Settings). Takes effect on the next dispatch; "
-                f"running jobs keep the old form."):
+                f"After Update no state is written back to GitHub "
+                f"any more (the sync-back step is gone); restores "
+                f"still read the last backup taken, and 9router "
+                f"settings are untouched. Takes effect on the next "
+                f"dispatch; running jobs keep the old form."):
             return
 
         def work():
@@ -2618,12 +2614,14 @@ class App:
         self._create_dialog(preset_count=None)
 
     def _create_dialog(self, preset_count):
-        """Create dialog: pick the repo and the count (preset 1 for
-        Add). Every new machine boots FRESH — no state is restored
-        from or synced back to GitHub, so there is no copy/raw
-        choice any more. When the chosen repo has no machines, a
-        prefix field appears too: it names the machines when a
-        brand-new repo is bootstrapped from the embedded template."""
+        """Create dialog: pick the repo, the count (preset 1 for Add),
+        and — asked every time — whether each new machine is RAW
+        (clean state) or a COPY of the first machine (its backed-up
+        state cloned: sessions/history, codebase-memory index and
+        9router db; plugins & skills are shared config and come along
+        either way). When the chosen repo has no machines, a prefix
+        field appears too: it names the machines when a brand-new
+        repo is bootstrapped from the embedded template."""
         cfg = self.scope_repo() or self.target_repo()
         if not cfg:
             self.log("add a repo first (Repos…)")
@@ -2656,16 +2654,27 @@ class App:
         prefix_ent = ttk.Entry(frm, textvariable=prefix_var, width=12)
         prefix_ent.grid(row=2, column=1, sticky="w", pady=3)
 
-        tk.Label(frm, text="Every new machine boots FRESH: no state "
-                           "is restored from or synced back to GitHub. "
-                           "Plugins, skills, agents and MCP config are "
-                           "rebuilt by the workflow on every boot. The "
-                           "OpenCode key comes from the repo's "
-                           "OPENCODE_API_KEY Secret — set a different "
-                           "one per repo manually in GitHub Settings.",
+        mode_var = tk.StringVar(value="copy")
+        tk.Label(frm, text="Start state:", bg=self.BG).grid(row=3, column=0, sticky="nw", pady=(8, 3))
+        modes = tk.Frame(frm, bg=self.BG)
+        modes.grid(row=3, column=1, sticky="w", pady=(8, 3))
+        tk.Radiobutton(modes, bg=self.BG, activebackground=self.BG,
+                       variable=mode_var, value="copy", wraplength=320,
+                       justify="left",
+                       text="Copy of the first machine — warm start "
+                            "(history, sessions, indexes, 9router db)"
+                       ).pack(anchor="w")
+        tk.Radiobutton(modes, bg=self.BG, activebackground=self.BG,
+                       variable=mode_var, value="raw", wraplength=320,
+                       justify="left",
+                       text="Raw — clean state, first sync creates it"
+                       ).pack(anchor="w")
+        tk.Label(frm, text="Plugins, skills, agents and MCP config live "
+                           "in the shared opencode/config — every new "
+                           "machine gets those either way.",
                  bg=self.BG, fg=self.MUTED, justify="left",
-                 wraplength=430).grid(row=3, column=0, columnspan=2,
-                                      sticky="w", pady=(8, 0))
+                 wraplength=430).grid(row=4, column=0, columnspan=2,
+                                      sticky="w", pady=(2, 0))
 
         info_var = tk.StringVar(value="")
         tk.Label(frm, textvariable=info_var, bg=self.BG, fg=self.MUTED,
@@ -2694,6 +2703,10 @@ class App:
             if n < 1 or n > 100:
                 info_var.set("Count must be between 1 and 100.")
                 return
+            mode_line = ("Each new machine also receives a full copy of "
+                         "the first machine's backed-up state."
+                         if mode_var.get() == "copy" else
+                         "New machines start raw (no state copied).")
             if inst:
                 first = sorted(inst, key=lambda x: parse_instance_name(x)[1])[0]
                 prefix = parse_instance_name(first)[0]
@@ -2702,7 +2715,7 @@ class App:
                 info_var.set(
                     f"Template (first machine): {first}\n"
                     f"Will create: {', '.join(names)}\n"
-                    f"New machines boot fresh (no state copied).\n"
+                    f"{mode_line}\n"
                     f"(preview from the loaded fleet — numbers that only "
                     f"have a state dir are skipped too, so the final "
                     f"numbering is recomputed at run time)")
@@ -2718,9 +2731,11 @@ class App:
                     "for this repo.\n"
                     f"If it is brand-new, will create: "
                     f"{', '.join(names)}\n"
-                    "New machines boot fresh in both cases.")
+                    "Copy falls back to raw in both cases: there is "
+                    "no live state to clone.")
 
         count_var.trace_add("write", update_info)
+        mode_var.trace_add("write", update_info)
         prefix_var.trace_add("write", update_info)
         combo.bind("<<ComboboxSelected>>", update_info)
         update_info()
@@ -2738,6 +2753,7 @@ class App:
                 messagebox.showerror("Create", "Count must be between 1 and 100.", parent=win)
                 return
             c = self.repo_by_label(repo_var.get())
+            mode = mode_var.get()
             pfx = prefix_var.get().strip()
             if pfx and not valid_prefix(pfx):
                 messagebox.showerror(
@@ -2748,26 +2764,26 @@ class App:
                 return
             win.destroy()
             if c:
-                self._start_create(c, n, prefix=pfx or None)
+                self._start_create(c, n, mode, prefix=pfx or None)
 
         ttk.Button(btns, text="Create", style="Accent.TButton", command=go).pack(side=tk.LEFT, padx=2)
         ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.LEFT, padx=2)
 
-    def _start_create(self, cfg, count, prefix=None):
+    def _start_create(self, cfg, count, mode="copy", prefix=None):
         def work():
             if not self._acquire_op(
-                    f"create {count} instance(s) in {cfg['label']}"):
+                    f"create {count} instance(s) in {cfg['label']} "
+                    f"({mode})"):
                 return
             outcome = [f"{cfg['label']}: create FAILED — see log", False]
             try:
                 created = create_instances(GH(cfg["pat"]), cfg, count,
-                                           self.log, mode="raw",
+                                           self.log, mode=mode,
                                            prefix_hint=prefix)
                 if created:
                     outcome[:] = [f"{cfg['label']}: {len(created)} "
                                   f"instance(s) created "
-                                  f"({created[0]}..{created[-1]}, "
-                                  f"fresh boot)",
+                                  f"({created[0]}..{created[-1]}, {mode})",
                                   True]
                     self.checked.update((cfg["label"], n) for n in created)
             finally:
@@ -2794,9 +2810,9 @@ class App:
         if not messagebox.askyesno(
                 "Delete checked machines",
                 f"Delete {total} checked machine(s) COMPLETELY?\n\n{lines}\n\n"
-                f"For each machine: its workflow file + any leftover "
-                f"data under opencode/instances/<name>/ (no longer "
-                f"read by the workflow) — one commit per repo.\n\n"
+                f"For each machine: its workflow file + ALL its data "
+                f"under opencode/instances/<name>/ (sessions, caches, "
+                f"9router db) — one commit per repo.\n\n"
                 f"The shared opencode/config is NOT touched.\n"
                 f"Active runs are cancelled and awaited first; a "
                 f"machine whose run will not stop is skipped."):
@@ -2870,8 +2886,7 @@ class App:
                 "Rename prefix",
                 f"Rename prefix '{current}' → '{new}' in {cfg['repo']}?\n\n"
                 f"• workflow files, names and WF_NAME ({current}1 → {new}1, …)\n"
-                f"• leftover instance data (if any) moves: "
-                f"opencode/instances/{current}N/ → {new}N/\n"
+                f"• instance data moves: opencode/instances/{current}N/ → {new}N/\n"
                 f"• machines come up as {new}1, {new}2, … on Tailscale\n"
                 f"• all of it in ONE commit\n\n"
                 f"NOT renamed: the h-dashboard branches (new ones are "
