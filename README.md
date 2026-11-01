@@ -31,44 +31,55 @@ and the same light theme.
   skipped on dispatch; dispatch and cancel run in parallel.
 - **Add instance… / Create N from first…** — create one instance, or
   give a number (e.g. **10**) and create that many at once, cloned
-  from the repo's first (lowest-numbered) machine in **one commit**;
-  numbering fills gaps. The dialog previews the names that will be
-  created; numbers that only have a leftover state dir are skipped
-  too, so a deleted machine's data never silently revives. With no
-  machine left, the template is recovered from git history (the most
-  recently deleted workflow), as before. In a **brand-new raw repo**
-  — a fresh account where no machine ever existed and there is no
-  history either — the first machines are bootstrapped from the
-  canonical workflow template embedded in the app, rendered for that
-  repo (its owner becomes the git identity and its `h-dashboard`
-  origin); the dialog then asks for the instance prefix (default
-  `op`). Such machines necessarily start Raw: there is no state
-  anywhere to copy yet. The repo still needs the account's usual
+  from the repo's first (lowest-numbered) machine's workflow file in
+  **one commit**; numbering fills gaps. The dialog previews the names
+  that will be created; numbers that only have a leftover state dir
+  are skipped too. With no machine left, the template is recovered
+  from git history (the most recently deleted workflow), as before.
+  In a **brand-new raw repo** — a fresh account where no machine ever
+  existed and there is no history either — the first machines are
+  bootstrapped from the canonical workflow template embedded in the
+  app, rendered for that repo (its owner becomes the git identity and
+  its `h-dashboard` origin); the dialog then asks for the instance
+  prefix (default `op`). Every new machine boots **fresh**: no state
+  is restored from or synced back to GitHub, and there is no
+  copy/raw choice any more. The repo still needs the account's usual
   secrets (`MY_PAT`, `RUNNER_PASSWORD`, `TAILSCALE_AUTHKEY`) set by
-  its owner before the first run can succeed.
-- **Raw or Copy — asked at every create** — the create dialog asks
-  how each new machine starts:
-  - **Copy of the first machine (warm start)** — the first machine's
-    backed-up per-instance state is cloned into the new machine in
-    the same commit, reusing the same git blobs (no re-upload):
-    `data/` (sessions and history), `cbm-cache/` (the
-    codebase-memory index) and `9router.sqlite` when present. The
-    new machine boots with the first machine's history instead of
-    starting blank. If the first machine has no backed-up state,
-    Copy falls back to Raw with a log line.
-  - **Raw** — clean state, created by the machine's own first sync.
-  
-  Plugins, skills, agents and MCP config need no copying either way:
-  they live in the shared `opencode/config` every instance uses.
+  its owner before the first run can succeed — plus `OPENCODE_API_KEY`
+  (see below).
+- **Fresh boot — no backup** — the embedded workflow template reads
+  no state from the repo and writes none back: no restore step, no
+  sync-back step. Every boot rebuilds OpenCode from scratch
+  (MCPs, Superpowers, oh-my-opencode-slim `free` preset, the
+  per-instance default model from `opencode/default-models.txt`);
+  sessions, indexes and servers added at runtime die with the
+  runner. 9router still installs and starts, with an empty database
+  each boot. Leftover `opencode/instances/<name>/` dirs from before
+  this change are never read again — Delete checked removes them.
+  The OpenCode Console key is **not** in any backup: set it manually
+  per repo as the `OPENCODE_API_KEY` Secret in GitHub Settings
+  (a repository Variable of the same name is only a fallback — its
+  value is not masked in logs). Without it the run fails fast in
+  step 13. A different key per repo is exactly how different keys
+  are used: one Secret per repo, no code change.
+- **⬆ Update checked / ⬆⬆ Update all** — re-render workflow files
+  from the embedded template: Update checked re-renders only the
+  ticked machines, Update all re-renders every workflow file in
+  every configured repo. A confirmation lists exactly which files
+  will change; files already on the template are left alone, files
+  with no `WF_NAME` are never overwritten, and each repo gets one
+  delta commit carrying only the changed files. Manual edits to a
+  workflow file are overwritten by Update. The new form takes
+  effect on the next dispatch — a running job keeps the old form.
 - **Delete checked** — tick any machines (across repos) and delete
-  them all: each machine's workflow file plus ALL of its data under
+  them all: each machine's workflow file plus any leftover data under
   `opencode/instances/<name>/`, in **one commit per repo**. The
   shared `opencode/config` is never touched. Active runs are
   cancelled first and awaited (bounded wait); a machine whose run
   will not confirm stopped is skipped, untouched.
 - **Rename prefix…** — for forks sharing one Tailscale network:
   renames the prefix in one repo (workflow files, names, `WF_NAME`)
-  and moves every state dir, all in one commit. h-dashboard branches
+  and moves every leftover state dir, all in one commit. h-dashboard branches
   and old Tailscale entries are NOT renamed. Active runs are
   cancelled first.
 - **Incremental state commits** — bulk create/delete/rename commits
@@ -98,8 +109,8 @@ and the same light theme.
 - **Hide cancelled** — drops machines whose latest run ended
   cancelled from the tree.
 
-New instances start with a clean state and create
-`opencode/instances/<name>/` on their first sync.
+New instances boot fresh — nothing is restored from or synced back
+to GitHub.
 
 ## Requirements
 
@@ -134,7 +145,7 @@ python unit_test.py
 ```
 
 Headless tests for the pure helpers, the settings migration, and the
-bulk create / bulk delete / rename fleet operations (against an
+bulk create / bulk delete / rename / update fleet operations (against an
 in-memory fake repo — including the one-commit guarantee and the
 skip-a-machine-whose-run-will-not-stop rule).
 
@@ -142,6 +153,8 @@ skip-a-machine-whose-run-will-not-stop rule).
 
 - `settings.json` holds PATs and passwords and is git-ignored — never
   committed.
-- Instance identity inside a workflow file is exactly three spots —
-  the workflow `name:`, the `WF_NAME:` env, and the sync-back commit
-  message (`from <name> instance`) — and cloning rewrites only those.
+- Instance identity inside a workflow file is exactly two spots —
+  the workflow `name:` and the `WF_NAME:` env — and cloning rewrites
+  only those. (Legacy files from before the no-backup template also
+  carry the old sync-back commit message; renaming rewrites it too
+  when present.)
