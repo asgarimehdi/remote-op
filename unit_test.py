@@ -534,4 +534,133 @@ assert "16. Tailscale Logout" in _t and "17. Tailscale" not in _t
 assert "git push origin" in _t  # fork-beta sync in step 7 stays
 print("backup-cancelled template (restore + 9router untouched) OK")
 
+# --- OpenRouter per-run choice ------------------------------------------------
+# settings: accounts migrate, round-trip, dedupe/drop malformed
+with tempfile.TemporaryDirectory() as td:
+    p = os.path.join(td, "settings.json")
+    with open(p, "w") as f:
+        json.dump({"repos": [], "openrouter_accounts": [
+            {"name": " acc1 ", "token": " sk-or-1 "},
+            {"name": "acc1", "token": "dup"},
+            {"name": "", "token": "noname"},
+            {"name": "acc2", "token": ""},
+            "junk", None]}, f)
+    s = app.load_settings(p)
+    assert s["openrouter_accounts"] == [
+        {"name": "acc1", "token": "sk-or-1"},
+        {"name": "acc2", "token": ""}], s["openrouter_accounts"]
+    app.save_settings(s, p)
+    assert app.load_settings(p)["openrouter_accounts"] == s["openrouter_accounts"]
+    with open(p, "w") as f:
+        json.dump({"repo": "haileen5/my-opencode", "password": "pw"}, f)
+    assert app.load_settings(p)["openrouter_accounts"] == []
+print("openrouter settings migration OK")
+
+# free-model filter: both prices zero only; unparseable/missing excluded
+_payload = {"data": [
+    {"id": "b/free-model:free", "pricing": {"prompt": "0", "completion": "0"}},
+    {"id": "a/paid", "pricing": {"prompt": "0.000001", "completion": "0"}},
+    {"id": "c/half-free", "pricing": {"prompt": "0", "completion": "0.000001"}},
+    {"id": "d/no-pricing"},
+    {"id": "e/bad-pricing", "pricing": {"prompt": "free", "completion": "0"}},
+    {"id": "b/free-model:free", "pricing": {"prompt": "0.00000000", "completion": "0"}},
+    {"id": "", "pricing": {"prompt": "0", "completion": "0"}}]}
+assert app.free_openrouter_model_ids(_payload) == ["b/free-model:free"]
+assert app.free_openrouter_model_ids({}) == []
+assert app.free_openrouter_model_ids({"data": "junk"}) == []
+print("openrouter free-model filter OK")
+
+
+class _Resp:
+    def __init__(self, body):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def _ok_opener(req, timeout=10):
+    return _Resp(json.dumps(_payload).encode())
+
+
+assert app.fetch_openrouter_models(urlopen=_ok_opener) == ["b/free-model:free"]
+
+
+def _bad_opener(req, timeout=10):
+    raise RuntimeError("offline")
+
+
+assert app.fetch_openrouter_models(urlopen=_bad_opener) == []
+
+
+def _junk_opener(req, timeout=10):
+    return _Resp(b"not json")
+
+
+assert app.fetch_openrouter_models(urlopen=_junk_opener) == []
+print("openrouter fetch (success + failure -> []) OK")
+
+# model normalization + secret lookup mirror + keys JSON + dispatch inputs
+assert app.normalize_openrouter_model("vendor/model:free") == "openrouter/vendor/model:free"
+assert app.normalize_openrouter_model("openrouter/vendor/model") == "openrouter/vendor/model"
+assert app.normalize_openrouter_model("  vendor/model  ") == "openrouter/vendor/model"
+assert app.normalize_openrouter_model("") == "" and app.normalize_openrouter_model(None) == ""
+_keys = '{"acc1": "sk-or-1", "acc2": ""}'
+assert app.openrouter_token_from_keys(_keys, "acc1") == "sk-or-1"
+assert app.openrouter_token_from_keys(_keys, "acc2") is None
+assert app.openrouter_token_from_keys(_keys, "nope") is None
+assert app.openrouter_token_from_keys("{broken", "acc1") is None
+assert app.openrouter_token_from_keys("[1,2]", "acc1") is None
+assert app.openrouter_token_from_keys('{"acc1": 7}', "acc1") is None
+assert json.loads(app.openrouter_keys_json(
+    [{"name": "acc1", "token": "sk-or-1"}, {"name": "acc2", "token": ""}])) == {"acc1": "sk-or-1"}
+assert app.openrouter_dispatch_inputs(None) == {}
+assert app.openrouter_dispatch_inputs(("acc1", "vendor/model:free")) == {
+    "openrouter_account": "acc1", "openrouter_model": "vendor/model:free"}
+print("openrouter normalize/lookup/inputs OK")
+
+
+class _RecGH(app.GH):
+    def __init__(self):
+        super().__init__("")
+        self.bodies = []
+
+    def api(self, method, path, body=None, timeout=90):
+        self.bodies.append(body)
+        return 204, {}
+
+
+_rec = _RecGH()
+assert _rec.dispatch("o/r", "opc", "rey1.yml") is True
+assert _rec.bodies[-1] == {"ref": "opc"}, _rec.bodies[-1]
+assert _rec.dispatch("o/r", "opc", "rey1.yml",
+                     {"openrouter_account": "acc1",
+                      "openrouter_model": "vendor/model:free"}) is True
+assert _rec.bodies[-1] == {"ref": "opc", "inputs": {
+    "openrouter_account": "acc1", "openrouter_model": "vendor/model:free"}}
+print("dispatch inputs OK")
+
+# template: inputs block, step 12b fail-fast secret lookup, §4/§4c override
+_t = app.embedded_template("syd1", "haileen5/my-opencode")
+assert "openrouter_account:" in _t and "openrouter_model:" in _t
+assert "12b. Resolve OpenRouter account for this run only" in _t
+assert "OPENROUTER_KEYS" in _t and "OPENROUTER_API_KEY" in _t
+assert "::add-mask::" in _t
+assert "OPENCODE_API_KEY" not in _t  # the Zen key stays out (see above)
+assert "sk-or" not in _t  # no token literal anywhere in the template
+assert 'if: inputs.openrouter_account != ' in _t
+assert 'os.environ.get("OPENROUTER_MODEL"' in _t
+assert 'cfg["preset"] = "free"' in _t
+# the override is per-run only: plain dispatch keeps the file/variable/built-in path
+assert "default-models.txt" in _t and "OPENCODE_DEFAULT_MODELS" in _t
+# 9router untouched by the OpenRouter change
+assert "12. Restore 9router db backup" in _t and "9router.sqlite" in _t
+print("openrouter template (inputs + 12b + §4/§4c override) OK")
+
 print("ALL OK")

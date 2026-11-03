@@ -29,6 +29,21 @@ and the same light theme.
   (across repos), or Run all / Stop all for one repo (the selected
   row's repo, else the target repo). Machines already running are
   skipped on dispatch; dispatch and cancel run in parallel.
+- **OpenRouter accounts (per-run choice)** — "OpenRouter accounts…"
+  (top bar) stores account names + tokens in `settings.json`, next
+  to the PATs. At Run time a dialog asks once per Run action: pick
+  an account and a free model from the live OpenRouter catalog
+  (searchable, or type a model ID), run as-is with the current Zen
+  setup, or cancel. The choice applies to that run only: Remote-Op
+  sends only the account name + model as `workflow_dispatch`
+  inputs, and the runner reads the token from the `OPENROUTER_KEYS`
+  GitHub Secret (one JSON object, name → token, set by the repo
+  owner in each fleet repo — the dialog's "Copy JSON for GitHub
+  Secret" builds it from the stored accounts). The workflow then
+  runs OpenCode on `openrouter/<model>` for the main model and
+  every slim agent seat, for that run only; a plain dispatch keeps
+  the per-instance Zen model. The token is never sent in a
+  dispatch, never logged, and never committed.
 - **Add instance… / Create N from first…** — create one instance, or
   give a number (e.g. **10**) and create that many at once, cloned
   from the repo's first (lowest-numbered) machine in **one commit**;
@@ -151,8 +166,9 @@ skip-a-machine-whose-run-will-not-stop rule).
 
 ## Notes
 
-- `settings.json` holds PATs and passwords and is git-ignored — never
-  committed.
+- `settings.json` holds PATs, passwords and OpenRouter tokens and is git-ignored — never
+  committed. The `OPENROUTER_KEYS` GitHub Secret (JSON: account name → token) is set by the
+  repo owner in each fleet repo; the dialog's "Copy JSON for GitHub Secret" builds it.
 - Instance identity inside a workflow file is exactly two spots —
   the workflow `name:` and the `WF_NAME:` env — and cloning rewrites
   only those. (Legacy files from before the sync-back removal also

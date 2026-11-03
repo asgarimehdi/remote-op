@@ -181,6 +181,18 @@ TEMPLATE_WORKFLOW = r'''# Managed by Remote-Op — re-rendered from the embedded
 name: {{WF_NAME}}
 on:
   workflow_dispatch:
+    inputs:
+      openrouter_account:
+        description: "OpenRouter account name (must exist in the OPENROUTER_KEYS secret JSON; empty = current Zen setup)"
+        required: false
+        default: ""
+        type: string
+      openrouter_model:
+        description: "OpenRouter model id, e.g. vendor/model:free (empty = current Zen setup)"
+        required: false
+        default: ""
+        type: string
+
 
 jobs:
   build:
@@ -464,6 +476,53 @@ jobs:
             echo '⚠️ 9router did not come up — check /tmp/9router.log'
           fi
 
+      # 12b. Per-run OpenRouter choice (Remote-Op dispatch inputs only).
+      #     Runs ONLY when a dispatch carried an account name; a plain
+      #     dispatch (or any other trigger) skips it and the run keeps
+      #     the current Zen setup. The token is NEVER sent in the
+      #     dispatch: it is read here from the OPENROUTER_KEYS secret
+      #     (one JSON object, account name -> token, set by the repo
+      #     owner), masked, and exported via $GITHUB_ENV so step 13
+      #     and the `opencode serve` process inherit OPENROUTER_API_KEY
+      #     from the environment — the built-in openrouter provider
+      #     authenticates from that variable, and no key is written
+      #     into opencode.json. Missing secret / bad JSON / unknown
+      #     account / missing model all fail fast, with the account
+      #     name only in the message — never the token or the JSON.
+      - name: 12b. Resolve OpenRouter account for this run only
+        if: inputs.openrouter_account != ''
+        env:
+          OPENROUTER_KEYS: ${{ secrets.OPENROUTER_KEYS }}
+          OPENROUTER_ACCOUNT: ${{ inputs.openrouter_account }}
+          OPENROUTER_MODEL: ${{ inputs.openrouter_model }}
+        run: |
+          python3 - <<'PYEOF_OR'
+          import json, os, sys
+          keys_raw = os.environ.get("OPENROUTER_KEYS", "")
+          if not keys_raw:
+              print("::error::OPENROUTER_KEYS secret is not set on this repo — "
+                    "set it (JSON: account name -> token) or dispatch without an OpenRouter account")
+              sys.exit(1)
+          try:
+              keys = json.loads(keys_raw)
+          except Exception:
+              print("::error::OPENROUTER_KEYS is not valid JSON")
+              sys.exit(1)
+          account = os.environ.get("OPENROUTER_ACCOUNT", "")
+          model = os.environ.get("OPENROUTER_MODEL", "")
+          if not model:
+              print("::error::openrouter_model is empty — dispatch with both an account and a model")
+              sys.exit(1)
+          token = keys.get(account) if isinstance(keys, dict) else None
+          if not isinstance(token, str) or not token:
+              print(f"::error::OpenRouter account '{account}' not found in OPENROUTER_KEYS")
+              sys.exit(1)
+          print("::add-mask::" + token)
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("OPENROUTER_API_KEY=" + token + "\n")
+              f.write("OPENROUTER_MODEL=" + model + "\n")
+          print(f"OpenRouter account '{account}' resolved for this run only")
+          PYEOF_OR
 
       - name: 13. Install OpenCode V2, restore state, configure MCPs + Superpowers plugin & start serve
         env:
@@ -585,6 +644,16 @@ jobs:
           # /update could never persist, and the update banner
           # only adds noise when a release lands mid-run.
           cfg["autoupdate"] = False
+          # Per-run OpenRouter override (step 12b exported
+          # OPENROUTER_MODEL only when the dispatch carried an account
+          # + model). It wins over the per-instance file/variable/
+          # built-in resolution below, for this run only: the runner's
+          # config is never committed back, so the next plain dispatch
+          # restores the Zen model. The openrouter provider reads
+          # OPENROUTER_API_KEY from the environment (step 12b), so no
+          # key is written into this config.
+          _or_raw = os.environ.get("OPENROUTER_MODEL", "").strip()
+          _or_model = ("openrouter/" + _or_raw if _or_raw and not _or_raw.startswith("openrouter/") else _or_raw)
           # The default model is PER-INSTANCE and comes from the
           # opencode/default-models.txt file in this repo: one full
           # model id per line (# comments and blank lines ignored).
@@ -624,7 +693,10 @@ jobs:
               else:
                   break
           _idx = int(_num) - 1 if _num else 0
-          cfg["model"] = _models[_idx % len(_models)]
+          if _or_model:
+              cfg["model"] = _or_model
+          else:
+              cfg["model"] = _models[_idx % len(_models)]
           mcp = cfg.get("mcp", {})
           mcp.pop("postgis", None)
           mcp.update({
@@ -764,6 +836,22 @@ jobs:
                                 ("nemotron", "opencode/nemotron-3.5-lightning-free"),
                                 ("glm", "opencode/glm-5.3-flash-free")):
               councillors.setdefault(cname, {})["model"] = cmodel
+          # Per-run OpenRouter override (same OPENROUTER_MODEL as §4):
+          # EVERY slim seat — agents, council and councillors — on the
+          # chosen model for this run only, and the preset forced to
+          # "free" so these seats are the ones actually used. The
+          # runner's slim config is never committed back, so the next
+          # plain dispatch restores the free-preset seats above.
+          _or_raw = os.environ.get("OPENROUTER_MODEL", "").strip()
+          if _or_raw:
+              _or_model = "openrouter/" + _or_raw if not _or_raw.startswith("openrouter/") else _or_raw
+              for _seat in list(free_preset.values()):
+                  if isinstance(_seat, dict):
+                      _seat["model"] = _or_model
+              for _seat in list(councillors.values()):
+                  if isinstance(_seat, dict):
+                      _seat["model"] = _or_model
+              cfg["preset"] = "free"
           cfg["council"].setdefault("default_preset", "default")
           cfg.setdefault("preset", "free")
           with open(path, "w") as f:
@@ -905,6 +993,125 @@ def ready_since(run, prev, now=None):
 
 
 # ---------------------------------------------------------------------------
+# OpenRouter accounts (per-run choice at Run time)
+# ---------------------------------------------------------------------------
+
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+OPENROUTER_KEYS_SECRET = "OPENROUTER_KEYS"
+
+
+def blank_openrouter_account():
+    return {"name": "", "token": ""}
+
+
+def normalize_openrouter_accounts(accounts):
+    """Settings-shape OpenRouter accounts: drop entries with no name,
+    trim name/token, keep the FIRST entry per name. Tokens are never
+    logged or echoed anywhere in this app."""
+    seen, out = set(), []
+    for a in accounts or []:
+        if not isinstance(a, dict):
+            continue
+        name = str(a.get("name", "")).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append({"name": name,
+                    "token": str(a.get("token", "")).strip()})
+    return out
+
+
+def openrouter_account_names(accounts):
+    return [a["name"] for a in normalize_openrouter_accounts(accounts)]
+
+
+def free_openrouter_model_ids(payload):
+    """FREE model ids from an OpenRouter /api/v1/models payload:
+    prompt AND completion pricing both exactly zero (strings like
+    "0" — parsed as floats; anything unparseable is not free).
+    Sorted, de-duplicated. The public catalog needs no API key, so
+    no token is ever sent to fetch it."""
+    ids = set()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    for entry in data or []:
+        if not isinstance(entry, dict):
+            continue
+        mid = entry.get("id")
+        pricing = entry.get("pricing")
+        if not isinstance(mid, str) or not mid or not isinstance(pricing, dict):
+            continue
+        try:
+            prompt = float(pricing.get("prompt"))
+            completion = float(pricing.get("completion"))
+        except (TypeError, ValueError):
+            continue
+        if prompt == 0.0 and completion == 0.0:
+            ids.add(mid)
+    return sorted(ids, key=str.casefold)
+
+
+def fetch_openrouter_models(urlopen=None, timeout=10):
+    """Free OpenRouter model ids, live from the public catalog.
+    [] on ANY failure (network, timeout, bad payload) — the Run
+    dialog then offers manual model entry instead of blocking."""
+    opener = urlopen or urllib.request.urlopen
+    try:
+        req = urllib.request.Request(
+            OPENROUTER_MODELS_URL,
+            headers={"User-Agent": "Remote-Op"})
+        with opener(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        return free_openrouter_model_ids(payload)
+    except Exception:
+        return []
+
+
+def normalize_openrouter_model(raw):
+    """OpenCode model id for a chosen OpenRouter slug: the catalog id
+    as listed (vendor/model[:free]), prefixed with openrouter/ when
+    it is not already. "" stays "" (no choice)."""
+    mid = (raw or "").strip()
+    if not mid:
+        return ""
+    return mid if mid.startswith("openrouter/") else "openrouter/" + mid
+
+
+def openrouter_token_from_keys(keys_json, account):
+    """Mirror of the runner-side lookup in step 12b: the token for
+    `account` in an OPENROUTER_KEYS JSON object, else None. Malformed
+    JSON, a non-object, or a non-string/empty token all yield None."""
+    try:
+        keys = json.loads(keys_json or "")
+    except Exception:
+        return None
+    if not isinstance(keys, dict):
+        return None
+    token = keys.get(account)
+    return token if isinstance(token, str) and token else None
+
+
+def openrouter_keys_json(accounts):
+    """The OPENROUTER_KEYS secret content for the configured
+    accounts: {name: token}. Only accounts with both a name and a
+    token are included; callers copy this to paste into GitHub."""
+    return json.dumps(
+        {a["name"]: a["token"]
+         for a in normalize_openrouter_accounts(accounts)
+         if a["token"]},
+        indent=2, ensure_ascii=False)
+
+
+def openrouter_dispatch_inputs(choice):
+    """workflow_dispatch inputs for a Run choice: None (run as-is)
+    -> no inputs at all; (account, model) -> only the account NAME
+    and the model slug. The token is NEVER an input."""
+    if not choice:
+        return {}
+    account, model = choice
+    return {"openrouter_account": account, "openrouter_model": model}
+
+
+# ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
 
@@ -951,7 +1158,10 @@ def load_settings(path=None):
     return {"repos": repos,
             "active": data.get("active", "") if isinstance(data, dict) else "",
             "hide_cancelled": bool(data.get("hide_cancelled"))
-            if isinstance(data, dict) else False}
+            if isinstance(data, dict) else False,
+            "openrouter_accounts": normalize_openrouter_accounts(
+                data.get("openrouter_accounts"))
+            if isinstance(data, dict) else []}
 
 
 def save_settings(settings, path=None):
@@ -1156,9 +1366,12 @@ class GH:
         code, _ = self.api("DELETE", f"repos/{repo}/actions/runs/{run_id}")
         return code == 204
 
-    def dispatch(self, repo, branch, workflow_file):
+    def dispatch(self, repo, branch, workflow_file, inputs=None):
+        body = {"ref": branch}
+        if inputs:
+            body["inputs"] = dict(inputs)
         code, _ = self.api("POST", f"repos/{repo}/actions/workflows/{workflow_file}/dispatches",
-                           {"ref": branch})
+                           body)
         return code == 204
 
     def cancel_run(self, repo, run_id):
@@ -1752,6 +1965,7 @@ class App:
         self.repo_combo.pack(side=tk.LEFT, padx=6)
         self.repo_combo.bind("<<ComboboxSelected>>", self._on_repo_switch)
         ttk.Button(top, text="Repos…", command=self._repos_dialog).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="OpenRouter accounts…", command=self._openrouter_dialog).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="↻ Refresh", command=self.refresh).pack(side=tk.LEFT, padx=2)
         self.status_var = tk.StringVar(value="")
         tk.Label(top, textvariable=self.status_var, bg=BG,
@@ -2309,7 +2523,7 @@ class App:
         self._fill_tree()
 
     # -- run / cancel -----------------------------------------------------------
-    def _dispatch(self, cfg, wf):
+    def _dispatch(self, cfg, wf, choice=None):
         info = self.instances.get((cfg["label"], wf))
         if not info:
             return
@@ -2317,14 +2531,20 @@ class App:
         if run.get("status") in ("in_progress", "queued"):
             self.log(f"{cfg['label']}/{wf}: already {run['status']} — skipped")
             return
-        if GH(cfg["pat"]).dispatch(cfg["repo"], cfg["branch"], info["file"]):
-            self.log(f"{cfg['label']}/{wf}: dispatched")
+        inputs = openrouter_dispatch_inputs(choice)
+        if GH(cfg["pat"]).dispatch(cfg["repo"], cfg["branch"], info["file"], inputs):
+            if inputs:
+                self.log(f"{cfg['label']}/{wf}: dispatched "
+                         f"(OpenRouter: {inputs['openrouter_account']} / "
+                         f"{inputs['openrouter_model']})")
+            else:
+                self.log(f"{cfg['label']}/{wf}: dispatched")
         else:
             self.log(f"{cfg['label']}/{wf}: dispatch FAILED")
 
-    def _dispatch_many(self, targets):
+    def _dispatch_many(self, targets, choice=None):
         with ThreadPoolExecutor(max_workers=6) as ex:
-            list(ex.map(lambda t: self._dispatch(*t), targets))
+            list(ex.map(lambda t: self._dispatch(*t, choice), targets))
         self.refresh()
 
     def run_checked(self):
@@ -2336,9 +2556,14 @@ class App:
         if not targets:
             self.log("nothing checked — tick the machines to run first")
             return
+        picked = self._openrouter_run_dialog()
+        if picked is None:
+            self.log("run cancelled — nothing dispatched")
+            return
+        choice = None if picked == "asis" else picked
 
         def work():
-            self._dispatch_many(targets)
+            self._dispatch_many(targets, choice)
         self.bg(work)
 
     def run_all(self):
@@ -2349,9 +2574,14 @@ class App:
         if not targets:
             self.log(f"{cfg['label']}: no machines loaded")
             return
+        picked = self._openrouter_run_dialog()
+        if picked is None:
+            self.log("run cancelled — nothing dispatched")
+            return
+        choice = None if picked == "asis" else picked
 
         def work():
-            self._dispatch_many(targets)
+            self._dispatch_many(targets, choice)
         self.bg(work)
 
     def _active_jobs(self, cfgs):
@@ -2910,6 +3140,121 @@ class App:
             self.refresh()
         self.bg(work)
 
+    # -- run choice dialog ------------------------------------------------------------
+    def _openrouter_run_dialog(self):
+        """One choice per Run action, for every machine it dispatches.
+
+        Returns None (cancel — nothing is dispatched), "asis" (run
+        with the current Zen setup, no inputs), or (account, model)
+        — the account NAME and the OpenRouter model slug for this run
+        only. The token is never part of the return value: the runner
+        reads it from the OPENROUTER_KEYS secret. The free-model list
+        loads in the background; if it fails, manual entry still
+        works and the dialog never blocks the run."""
+        accounts = normalize_openrouter_accounts(
+            self.settings.get("openrouter_accounts", []))
+        names = [a["name"] for a in accounts]
+        result = {"value": None}
+        win = tk.Toplevel(self.root)
+        win.title("Run machines")
+        win.geometry("560x500")
+        win.transient(self.root)
+
+        tk.Label(win, text="OpenRouter account (this run only):",
+                 anchor="w").pack(fill=tk.X, padx=10, pady=(10, 2))
+        acct_var = tk.StringVar()
+        acct_combo = ttk.Combobox(win, textvariable=acct_var,
+                                  values=names, state="readonly", width=40)
+        acct_combo.pack(fill=tk.X, padx=10)
+        if names:
+            acct_combo.current(0)
+        else:
+            acct_combo.configure(state="disabled")
+            tk.Label(win, text="No OpenRouter accounts yet — add them in "
+                              "'OpenRouter accounts…' (top bar), or run "
+                              "as-is below.", fg="#666", wraplength=520,
+                     justify="left").pack(fill=tk.X, padx=10, pady=2)
+
+        tk.Label(win, text="Free model (live list, or type an id below):",
+                 anchor="w").pack(fill=tk.X, padx=10, pady=(10, 2))
+        search_var = tk.StringVar()
+        tk.Entry(win, textvariable=search_var).pack(fill=tk.X, padx=10)
+        lb = tk.Listbox(win, height=12)
+        lb.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        status_var = tk.StringVar(value="Loading free models…")
+        tk.Label(win, textvariable=status_var, fg="#666",
+                 anchor="w").pack(fill=tk.X, padx=10)
+        state = {"models": []}
+
+        def refill():
+            q = search_var.get().strip().casefold()
+            lb.delete(0, tk.END)
+            for mid in state["models"]:
+                if q and q not in mid.casefold():
+                    continue
+                lb.insert(tk.END, mid)
+
+        search_var.trace_add("write", lambda *_a: refill())
+
+        def load_models():
+            models = fetch_openrouter_models()
+
+            def done():
+                if not win.winfo_exists():
+                    return
+                state["models"] = models
+                if models:
+                    status_var.set(f"{len(models)} free models")
+                else:
+                    status_var.set("Could not load the model list — "
+                                   "type a model ID instead.")
+                refill()
+            self.root.after(0, done)
+
+        threading.Thread(target=load_models, daemon=True).start()
+
+        tk.Label(win, text="Or type a model ID (wins over the list):",
+                 anchor="w").pack(fill=tk.X, padx=10, pady=(6, 2))
+        manual_var = tk.StringVar()
+        tk.Entry(win, textvariable=manual_var).pack(fill=tk.X, padx=10)
+
+        def finish(value):
+            result["value"] = value
+            win.destroy()
+
+        def run_openrouter():
+            if not names:
+                status_var.set("No OpenRouter account — add one first, "
+                               "or run as-is.")
+                return
+            account = acct_var.get().strip()
+            if not account:
+                status_var.set("Pick an OpenRouter account first.")
+                return
+            model = manual_var.get().strip()
+            if not model:
+                sel = lb.curselection()
+                if not sel:
+                    status_var.set("Pick a model, type a model ID, "
+                                   "or run as-is.")
+                    return
+                model = lb.get(sel[0])
+            finish((account, model))
+
+        btns = tk.Frame(win)
+        btns.pack(fill=tk.X, padx=10, pady=10)
+        ttk.Button(btns, text="▶ Run with OpenRouter",
+                   style="Accent.TButton",
+                   command=run_openrouter).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Run as-is (current Zen setup)",
+                   command=lambda: finish("asis")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Cancel",
+                   command=lambda: finish(None)).pack(side=tk.LEFT, padx=2)
+        win.protocol("WM_DELETE_WINDOW", lambda: finish(None))
+        win.grab_set()
+        win.wait_window()
+        return result["value"]
+
     # -- repos dialog ---------------------------------------------------------------------
     def _repos_dialog(self):
         win = tk.Toplevel(self.root)
@@ -3028,6 +3373,140 @@ class App:
             # form is bound to a real slot — otherwise whatever is
             # typed first is discarded on save.
             new_repo()
+
+    # -- openrouter accounts dialog -----------------------------------------------------
+    def _openrouter_dialog(self):
+        """Manage the OpenRouter accounts stored in settings.json
+        (name + token, like the PATs in the Repos dialog). The token
+        is NEVER sent by this app at dispatch and never logged: the
+        runner reads it from the OPENROUTER_KEYS GitHub Secret, and
+        Remote-Op sends only the account name + model. 'Copy JSON'
+        builds that secret's content from these accounts for pasting
+        into GitHub — set the secret yourself, in each fleet repo."""
+        accounts = self.settings.setdefault("openrouter_accounts", [])
+        self.settings["openrouter_accounts"] = normalize_openrouter_accounts(accounts)
+        accounts = self.settings["openrouter_accounts"]
+        win = tk.Toplevel(self.root)
+        win.title("OpenRouter accounts")
+        win.geometry("720x400")
+        lb = tk.Listbox(win, width=24)
+        lb.pack(side=tk.LEFT, fill=tk.Y, padx=6, pady=6)
+        for a in accounts:
+            lb.insert(tk.END, a["name"])
+
+        form = tk.Frame(win)
+        form.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=6, pady=6)
+        vars_ = {}
+        rows = [("name", "Name", 30, False),
+                ("token", "Token", 46, True)]
+        for key, title, w, secret in rows:
+            r = tk.Frame(form)
+            r.pack(fill=tk.X, pady=2)
+            tk.Label(r, text=title, width=12, anchor="w").pack(side=tk.LEFT)
+            v = tk.StringVar()
+            tk.Entry(r, textvariable=v, width=w,
+                     show="•" if secret else "").pack(side=tk.LEFT)
+            vars_[key] = v
+        tk.Label(form, text="Tokens live in settings.json next to the exe "
+                            "(like PATs — keep the file private) and are "
+                            "never sent at dispatch. The runner reads the "
+                            "token from the OPENROUTER_KEYS GitHub Secret "
+                            "(JSON: name -> token), which you set yourself "
+                            "in each fleet repo. 'Copy JSON' builds that "
+                            "secret's content from the accounts here.",
+                 fg="#666", wraplength=430,
+                 justify="left").pack(anchor="w", pady=4)
+        state = {"idx": None}
+
+        def load_fields(idx):
+            state["idx"] = idx
+            a = accounts[idx] if idx is not None else blank_openrouter_account()
+            for k, v in vars_.items():
+                v.set(a.get(k, ""))
+
+        def flush():
+            if state["idx"] is None:
+                return
+            a = accounts[state["idx"]]
+            for k, v in vars_.items():
+                a[k] = v.get().strip()
+
+        def on_select(_evt=None):
+            flush()
+            sel = lb.curselection()
+            if sel:
+                load_fields(sel[0])
+
+        lb.bind("<<ListboxSelect>>", on_select)
+
+        btns = tk.Frame(form)
+        btns.pack(fill=tk.X, pady=8)
+
+        def new_account():
+            flush()
+            accounts.append(blank_openrouter_account())
+            lb.insert(tk.END, "")
+            lb.selection_clear(0, tk.END)
+            lb.selection_set(tk.END)
+            load_fields(len(accounts) - 1)
+
+        def del_account():
+            sel = lb.curselection()
+            if not sel:
+                return
+            del accounts[sel[0]]
+            lb.delete(sel[0])
+            state["idx"] = None
+            load_fields(None)
+
+        def copy_json():
+            flush()
+            text = openrouter_keys_json(accounts)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.log("OPENROUTER_KEYS JSON copied — paste it as the "
+                     "OPENROUTER_KEYS secret in each fleet repo "
+                     "(token values are never logged).")
+
+        def save_close():
+            if state["idx"] is None and any(
+                    v.get().strip() for v in vars_.values()):
+                accounts.append(blank_openrouter_account())
+                lb.insert(tk.END, "")
+                state["idx"] = len(accounts) - 1
+            flush()
+            kept = [a for a in accounts if a.get("name")]
+            names = [a["name"] for a in kept]
+            if len(names) != len(set(names)):
+                messagebox.showerror(
+                    "Remote-Op",
+                    "Account names must be unique — rename the duplicate "
+                    "before saving.")
+                return
+            self.settings["openrouter_accounts"] = normalize_openrouter_accounts(kept)
+            try:
+                save_settings(self.settings)
+            except OSError as e:
+                messagebox.showerror(
+                    "Remote-Op",
+                    f"Could not save settings:\n{SETTINGS_PATH}\n\n{e}")
+                return
+            self.log(f"OpenRouter accounts saved "
+                     f"({len(self.settings['openrouter_accounts'])} account(s); "
+                     f"tokens are never logged).")
+            win.destroy()
+
+        tk.Button(btns, text="New", command=new_account).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Delete", command=del_account).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Copy JSON for GitHub Secret",
+                  command=copy_json).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Save & close",
+                  command=save_close).pack(side=tk.LEFT, padx=10)
+        if accounts:
+            lb.selection_set(0)
+            load_fields(0)
+        else:
+            new_account()
 
     def _persist_password_setx(self):
         """Persist the TARGET repo's server password for future
