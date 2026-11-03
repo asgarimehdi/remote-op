@@ -1111,6 +1111,41 @@ def openrouter_dispatch_inputs(choice):
     return {"openrouter_account": account, "openrouter_model": model}
 
 
+def openrouter_account_for_instance(wf_name, accounts):
+    """Account NAME for one machine, by its trailing instance
+    number: machine 1 -> the 1st account in settings order,
+    machine 2 -> the 2nd, and so on, WRAPPING modulo the account
+    count when there are more machines than accounts (machine 4
+    with 3 accounts uses the 1st again). A name with no trailing
+    number uses the 1st account. None when no accounts are
+    configured. Only the account NAME is ever returned — tokens
+    never leave settings.json through this app."""
+    names = openrouter_account_names(accounts)
+    if not names:
+        return None
+    m = re.search(r"(\d+)$", wf_name or "")
+    n = int(m.group(1)) if m else 1
+    return names[(n - 1) % len(names)]
+
+
+def openrouter_dispatch_inputs_for_machine(choice, wf, accounts):
+    """workflow_dispatch inputs for ONE machine. choice is None /
+    "asis" -> {}; ("per-machine", model) -> the account resolved
+    for wf's instance number + the model, or {} when no account
+    resolves (the caller must NOT dispatch plain in that case — a
+    silent Zen fallback would hide the misconfiguration); a legacy
+    (account, model) tuple -> that account + model."""
+    if not choice or choice == "asis":
+        return {}
+    if isinstance(choice, tuple) and len(choice) == 2 \
+            and choice[0] == "per-machine":
+        account = openrouter_account_for_instance(wf, accounts)
+        if account is None:
+            return {}
+        return {"openrouter_account": account, "openrouter_model": choice[1]}
+    return openrouter_dispatch_inputs(choice)
+
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
@@ -2531,7 +2566,14 @@ class App:
         if run.get("status") in ("in_progress", "queued"):
             self.log(f"{cfg['label']}/{wf}: already {run['status']} — skipped")
             return
-        inputs = openrouter_dispatch_inputs(choice)
+        inputs = openrouter_dispatch_inputs_for_machine(
+            choice, wf, self.settings.get("openrouter_accounts", []))
+        if choice and isinstance(choice, tuple) and choice[0] == "per-machine" \
+                and not inputs:
+            self.log(f"{cfg['label']}/{wf}: no OpenRouter account "
+                     f"configured — add accounts in 'OpenRouter "
+                     f"accounts…' or run as-is; NOT dispatched")
+            return
         if GH(cfg["pat"]).dispatch(cfg["repo"], cfg["branch"], info["file"], inputs):
             if inputs:
                 self.log(f"{cfg['label']}/{wf}: dispatched "
@@ -2556,11 +2598,11 @@ class App:
         if not targets:
             self.log("nothing checked — tick the machines to run first")
             return
-        picked = self._openrouter_run_dialog()
+        picked = self._openrouter_run_dialog(targets)
         if picked is None:
             self.log("run cancelled — nothing dispatched")
             return
-        choice = None if picked == "asis" else picked
+        choice = None if picked == "asis" else ("per-machine", picked)
 
         def work():
             self._dispatch_many(targets, choice)
@@ -2574,11 +2616,11 @@ class App:
         if not targets:
             self.log(f"{cfg['label']}: no machines loaded")
             return
-        picked = self._openrouter_run_dialog()
+        picked = self._openrouter_run_dialog(targets)
         if picked is None:
             self.log("run cancelled — nothing dispatched")
             return
-        choice = None if picked == "asis" else picked
+        choice = None if picked == "asis" else ("per-machine", picked)
 
         def work():
             self._dispatch_many(targets, choice)
@@ -3141,16 +3183,21 @@ class App:
         self.bg(work)
 
     # -- run choice dialog ------------------------------------------------------------
-    def _openrouter_run_dialog(self):
-        """One choice per Run action, for every machine it dispatches.
+    def _openrouter_run_dialog(self, targets=None):
+        """Pick ONLY the model for this Run action. The account is
+        NOT picked here: each machine uses the account matching its
+        instance number (machine 1 -> 1st account in settings order,
+        machine 2 -> 2nd, wrapping — see
+        openrouter_account_for_instance), and the preview below
+        shows the mapping for the machines about to run.
 
         Returns None (cancel — nothing is dispatched), "asis" (run
-        with the current Zen setup, no inputs), or (account, model)
-        — the account NAME and the OpenRouter model slug for this run
-        only. The token is never part of the return value: the runner
-        reads it from the OPENROUTER_KEYS secret. The free-model list
-        loads in the background; if it fails, manual entry still
-        works and the dialog never blocks the run."""
+        with the current Zen setup, no inputs), or the OpenRouter
+        model slug for this run only. The token is never part of
+        the return value: the runner reads it from the
+        OPENROUTER_KEYS secret. The free-model list loads in the
+        background; if it fails, manual entry still works and the
+        dialog never blocks the run."""
         accounts = normalize_openrouter_accounts(
             self.settings.get("openrouter_accounts", []))
         names = [a["name"] for a in accounts]
@@ -3160,16 +3207,25 @@ class App:
         win.geometry("560x500")
         win.transient(self.root)
 
-        tk.Label(win, text="OpenRouter account (this run only):",
+        tk.Label(win, text="Account per machine (automatic — not picked "
+                          "here): machine 1 → 1st account, machine 2 → "
+                          "2nd, and so on (wraps). Reorder accounts in "
+                          "'OpenRouter accounts…' (top bar).",
+                 fg="#666", wraplength=520, justify="left",
                  anchor="w").pack(fill=tk.X, padx=10, pady=(10, 2))
-        acct_var = tk.StringVar()
-        acct_combo = ttk.Combobox(win, textvariable=acct_var,
-                                  values=names, state="readonly", width=40)
-        acct_combo.pack(fill=tk.X, padx=10)
-        if names:
-            acct_combo.current(0)
-        else:
-            acct_combo.configure(state="disabled")
+        if targets and names:
+            seen = []
+            for _cfg, _wf in targets:
+                if _wf not in seen:
+                    seen.append(_wf)
+            preview = ", ".join(
+                f"{wf} → {openrouter_account_for_instance(wf, accounts)}"
+                for wf in seen[:10])
+            if len(seen) > 10:
+                preview += f", … (+{len(seen) - 10} more)"
+            tk.Label(win, text="This run: " + preview, wraplength=520,
+                     justify="left", anchor="w").pack(fill=tk.X, padx=10)
+        elif not names:
             tk.Label(win, text="No OpenRouter accounts yet — add them in "
                               "'OpenRouter accounts…' (top bar), or run "
                               "as-is below.", fg="#666", wraplength=520,
@@ -3224,12 +3280,9 @@ class App:
 
         def run_openrouter():
             if not names:
-                status_var.set("No OpenRouter account — add one first, "
+                status_var.set("No OpenRouter accounts — add them in "
+                               "'OpenRouter accounts…' first, "
                                "or run as-is.")
-                return
-            account = acct_var.get().strip()
-            if not account:
-                status_var.set("Pick an OpenRouter account first.")
                 return
             model = manual_var.get().strip()
             if not model:
@@ -3239,7 +3292,7 @@ class App:
                                    "or run as-is.")
                     return
                 model = lb.get(sel[0])
-            finish((account, model))
+            finish(model)
 
         btns = tk.Frame(win)
         btns.pack(fill=tk.X, padx=10, pady=10)
@@ -3377,12 +3430,15 @@ class App:
     # -- openrouter accounts dialog -----------------------------------------------------
     def _openrouter_dialog(self):
         """Manage the OpenRouter accounts stored in settings.json
-        (name + token, like the PATs in the Repos dialog). The token
-        is NEVER sent by this app at dispatch and never logged: the
-        runner reads it from the OPENROUTER_KEYS GitHub Secret, and
-        Remote-Op sends only the account name + model. 'Copy JSON'
-        builds that secret's content from these accounts for pasting
-        into GitHub — set the secret yourself, in each fleet repo."""
+        (name + token, like the PATs in the Repos dialog). The LIST
+        ORDER is the machine mapping: machine 1 uses the 1st
+        account, machine 2 the 2nd, and so on (wrapping) — the Run
+        dialog picks only the model. The token is NEVER sent by
+        this app at dispatch and never logged: the runner reads it
+        from the OPENROUTER_KEYS GitHub Secret, and Remote-Op sends
+        only the account name + model. 'Copy JSON' builds that
+        secret's content from these accounts for pasting into
+        GitHub — set the secret yourself, in each fleet repo."""
         accounts = self.settings.setdefault("openrouter_accounts", [])
         self.settings["openrouter_accounts"] = normalize_openrouter_accounts(accounts)
         accounts = self.settings["openrouter_accounts"]
@@ -3413,7 +3469,12 @@ class App:
                             "token from the OPENROUTER_KEYS GitHub Secret "
                             "(JSON: name -> token), which you set yourself "
                             "in each fleet repo. 'Copy JSON' builds that "
-                            "secret's content from the accounts here.",
+                            "secret's content from the accounts here. "
+                            "ORDER MATTERS: machine 1 uses the 1st account "
+                            "in this list, machine 2 the 2nd, and so on "
+                            "(wrapping when there are more machines than "
+                            "accounts) — to reorder, delete and re-add an "
+                            "account.",
                  fg="#666", wraplength=430,
                  justify="left").pack(anchor="w", pady=4)
         state = {"idx": None}

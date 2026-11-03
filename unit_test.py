@@ -661,6 +661,31 @@ assert 'cfg["preset"] = "free"' in _t
 assert "default-models.txt" in _t and "OPENCODE_DEFAULT_MODELS" in _t
 # 9router untouched by the OpenRouter change
 assert "12. Restore 9router db backup" in _t and "9router.sqlite" in _t
+# per-machine account mapping: machine N -> accounts[N-1], wrapping
+_accts = [{"name": "a1", "token": "t1"}, {"name": "a2", "token": "t2"},
+          {"name": "a3", "token": "t3"}]
+assert app.openrouter_account_for_instance("syd1", _accts) == "a1"
+assert app.openrouter_account_for_instance("syd2", _accts) == "a2"
+assert app.openrouter_account_for_instance("syd3", _accts) == "a3"
+assert app.openrouter_account_for_instance("syd4", _accts) == "a1"  # wraps
+assert app.openrouter_account_for_instance("sad11", _accts) == "a2"  # (11-1)%3
+assert app.openrouter_account_for_instance("sad10", _accts) == "a1"  # (10-1)%3
+assert app.openrouter_account_for_instance("op", _accts) == "a1"  # no number
+assert app.openrouter_account_for_instance("syd1", []) is None
+assert app.openrouter_account_for_instance(
+    "syd1", [{"name": "  ", "token": "x"}]) is None
+assert app.openrouter_dispatch_inputs_for_machine(
+    ("per-machine", "m:free"), "syd2", _accts) == {
+        "openrouter_account": "a2", "openrouter_model": "m:free"}
+assert app.openrouter_dispatch_inputs_for_machine(
+    ("per-machine", "m:free"), "syd1", []) == {}
+assert app.openrouter_dispatch_inputs_for_machine(None, "syd1", _accts) == {}
+assert app.openrouter_dispatch_inputs_for_machine("asis", "syd1", _accts) == {}
+assert app.openrouter_dispatch_inputs_for_machine(
+    ("acc9", "m:free"), "syd1", _accts) == {
+        "openrouter_account": "acc9", "openrouter_model": "m:free"}
+print("openrouter per-machine account mapping OK")
+
 print("openrouter template (inputs + 12b + §4/§4c override) OK")
 
 print("ALL OK")
