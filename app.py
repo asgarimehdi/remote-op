@@ -1025,6 +1025,23 @@ def openrouter_account_names(accounts):
     return [a["name"] for a in normalize_openrouter_accounts(accounts)]
 
 
+def move_openrouter_account(accounts, idx, delta):
+    """Move one account by `delta` (-1 up, +1 down) in list order.
+    List order IS the machine mapping, so this only swaps two
+    entries in place — names and tokens travel with their entry,
+    nothing is retyped or dropped. At either end, or for an
+    out-of-range index, it is a no-op. Returns the entry's new
+    index (the old one when nothing moved)."""
+    if not isinstance(accounts, list):
+        return idx
+    new_idx = idx + delta
+    if idx < 0 or idx >= len(accounts) or new_idx < 0 \
+            or new_idx >= len(accounts):
+        return idx
+    accounts[idx], accounts[new_idx] = accounts[new_idx], accounts[idx]
+    return new_idx
+
+
 def free_openrouter_model_ids(payload):
     """FREE model ids from an OpenRouter /api/v1/models payload:
     prompt AND completion pricing both exactly zero (strings like
@@ -3473,8 +3490,8 @@ class App:
                             "ORDER MATTERS: machine 1 uses the 1st account "
                             "in this list, machine 2 the 2nd, and so on "
                             "(wrapping when there are more machines than "
-                            "accounts) — to reorder, delete and re-add an "
-                            "account.",
+                            "accounts) — reorder with Move up / Move down, "
+                            "without retyping a token.",
                  fg="#666", wraplength=430,
                  justify="left").pack(anchor="w", pady=4)
         state = {"idx": None}
@@ -3520,6 +3537,21 @@ class App:
             state["idx"] = None
             load_fields(None)
 
+        def move_account(delta):
+            sel = lb.curselection()
+            if not sel:
+                return
+            flush()
+            new_idx = move_openrouter_account(accounts, sel[0], delta)
+            if new_idx == sel[0]:
+                return
+            lb.delete(0, tk.END)
+            for a in accounts:
+                lb.insert(tk.END, a["name"])
+            lb.selection_clear(0, tk.END)
+            lb.selection_set(new_idx)
+            load_fields(new_idx)
+
         def copy_json():
             flush()
             text = openrouter_keys_json(accounts)
@@ -3559,6 +3591,10 @@ class App:
 
         tk.Button(btns, text="New", command=new_account).pack(side=tk.LEFT, padx=2)
         tk.Button(btns, text="Delete", command=del_account).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Move up",
+                  command=lambda: move_account(-1)).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Move down",
+                  command=lambda: move_account(1)).pack(side=tk.LEFT, padx=2)
         tk.Button(btns, text="Copy JSON for GitHub Secret",
                   command=copy_json).pack(side=tk.LEFT, padx=2)
         tk.Button(btns, text="Save & close",

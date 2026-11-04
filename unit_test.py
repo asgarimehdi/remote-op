@@ -686,6 +686,22 @@ assert app.openrouter_dispatch_inputs_for_machine(
         "openrouter_account": "acc9", "openrouter_model": "m:free"}
 print("openrouter per-machine account mapping OK")
 
+# reorder helper: order is the machine mapping, so moving must swap
+# entries whole (token travels with the name) and stop at the ends
+_re = [{"name": "a1", "token": "t1"}, {"name": "a2", "token": "t2"},
+       {"name": "a3", "token": "t3"}]
+assert app.move_openrouter_account(_re, 1, -1) == 0
+assert [a["name"] for a in _re] == ["a2", "a1", "a3"]
+assert [a["token"] for a in _re] == ["t2", "t1", "t3"]
+assert app.move_openrouter_account(_re, 0, -1) == 0  # top: no-op
+assert app.move_openrouter_account(_re, 2, 1) == 2  # bottom: no-op
+assert app.move_openrouter_account(_re, 9, 1) == 9  # bad index: no-op
+assert [a["name"] for a in _re] == ["a2", "a1", "a3"]
+assert app.move_openrouter_account(_re, 0, 1) == 1
+assert app.openrouter_account_for_instance("syd1", _re) == "a1"
+assert app.openrouter_account_for_instance("syd2", _re) == "a2"
+print("openrouter account reorder OK")
+
 print("openrouter template (inputs + 12b + §4/§4c override) OK")
 
 print("ALL OK")

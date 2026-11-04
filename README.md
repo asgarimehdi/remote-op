@@ -33,7 +33,8 @@ and the same light theme.
   (top bar) stores account names + tokens in `settings.json`, next
   to the PATs. The LIST ORDER is the mapping: machine 1 uses the
   1st account, machine 2 the 2nd, and so on (wrapping when there
-  are more machines than accounts). At Run time a dialog asks once
+  are more machines than accounts); reorder with Move up / Move
+  down in the accounts dialog, without retyping a token. At Run time a dialog asks once
   per Run action for ONLY the model — a free model from the live
   OpenRouter catalog (searchable, or type a model ID), run as-is
   with the current Zen setup, or cancel — and shows which account
