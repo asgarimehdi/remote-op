@@ -192,6 +192,16 @@ on:
         required: false
         default: ""
         type: string
+      nvidia_account:
+        description: "NVIDIA account name (must exist in the NVIDIA_KEYS secret JSON; empty = current Zen setup)"
+        required: false
+        default: ""
+        type: string
+      nvidia_model:
+        description: "NVIDIA NIM model id, e.g. nvidia/nemotron-3-ultra-550b-a55b (empty = current Zen setup)"
+        required: false
+        default: ""
+        type: string
 
 
 jobs:
@@ -524,6 +534,56 @@ jobs:
           print(f"OpenRouter account '{account}' resolved for this run only")
           PYEOF_OR
 
+      # 12c. Per-run NVIDIA choice (Remote-Op dispatch inputs only).
+      #     Runs ONLY when a dispatch carried an account name; a plain
+      #     dispatch (or any other trigger) skips it and the run keeps
+      #     the current Zen setup. Same shape as step 12b: the token is
+      #     NEVER sent in the dispatch — it is read here from the
+      #     NVIDIA_KEYS secret (one JSON object, account name -> token,
+      #     set by the repo owner), masked, and exported via
+      #     $GITHUB_ENV so step 13 and the `opencode serve` process
+      #     inherit NVIDIA_API_KEY from the environment. §4 writes the
+      #     `nvidia` provider block (OpenAI-compatible, NVIDIA NIM
+      #     endpoint) into opencode.json for this run only, reading
+      #     the key from that variable — no key is written into the
+      #     config. Missing secret / bad JSON / unknown account /
+      #     missing model all fail fast, with the account name only
+      #     in the message — never the token or the JSON.
+      - name: 12c. Resolve NVIDIA account for this run only
+        if: inputs.nvidia_account != ''
+        env:
+          NVIDIA_KEYS: ${{ secrets.NVIDIA_KEYS }}
+          NVIDIA_ACCOUNT: ${{ inputs.nvidia_account }}
+          NVIDIA_MODEL: ${{ inputs.nvidia_model }}
+        run: |
+          python3 - <<'PYEOF_NV'
+          import json, os, sys
+          keys_raw = os.environ.get("NVIDIA_KEYS", "")
+          if not keys_raw:
+              print("::error::NVIDIA_KEYS secret is not set on this repo — "
+                    "set it (JSON: account name -> token) or dispatch without an NVIDIA account")
+              sys.exit(1)
+          try:
+              keys = json.loads(keys_raw)
+          except Exception:
+              print("::error::NVIDIA_KEYS is not valid JSON")
+              sys.exit(1)
+          account = os.environ.get("NVIDIA_ACCOUNT", "")
+          model = os.environ.get("NVIDIA_MODEL", "")
+          if not model:
+              print("::error::nvidia_model is empty — dispatch with both an account and a model")
+              sys.exit(1)
+          token = keys.get(account) if isinstance(keys, dict) else None
+          if not isinstance(token, str) or not token:
+              print(f"::error::NVIDIA account '{account}' not found in NVIDIA_KEYS")
+              sys.exit(1)
+          print("::add-mask::" + token)
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("NVIDIA_API_KEY=" + token + "\n")
+              f.write("NVIDIA_MODEL=" + model + "\n")
+          print(f"NVIDIA account '{account}' resolved for this run only")
+          PYEOF_NV
+
       - name: 13. Install OpenCode V2, restore state, configure MCPs + Superpowers plugin & start serve
         env:
           OPENCODE_SERVER_PASSWORD: ${{ secrets.RUNNER_PASSWORD }}
@@ -654,6 +714,30 @@ jobs:
           # key is written into this config.
           _or_raw = os.environ.get("OPENROUTER_MODEL", "").strip()
           _or_model = ("openrouter/" + _or_raw if _or_raw and not _or_raw.startswith("openrouter/") else _or_raw)
+          # Per-run NVIDIA override (step 12c exported NVIDIA_MODEL
+          # only when the dispatch carried an account + model). Unlike
+          # the built-in openrouter provider, NVIDIA needs an explicit
+          # provider block: an OpenAI-compatible provider pointing at
+          # the NVIDIA NIM endpoint, reading its key from
+          # NVIDIA_API_KEY in the environment (step 12c), with the
+          # chosen model registered in its `models` map (OpenCode
+          # only resolves models listed there). The model id is the
+          # full NIM id (e.g. nvidia/nemotron-3-ultra-550b-a55b), so
+          # the OpenCode ref is nvidia/<that id>. The block is written
+          # only for an NVIDIA run; a plain dispatch leaves whatever
+          # provider block the restored config already had untouched
+          # (and the model resolution below restores the Zen model).
+          # When BOTH overrides are somehow set, NVIDIA wins — the
+          # Run dialog only ever sends one provider's inputs.
+          # The NIM id itself usually contains a slash (e.g.
+          # nvidia/nemotron-3-ultra-550b-a55b), so the OpenCode ref
+          # is nvidia/<NIM id> — three segments. A value already in
+          # that triple form has its first nvidia/ stripped back to
+          # the NIM id; anything else is taken as the NIM id as-is.
+          _nv_id = os.environ.get("NVIDIA_MODEL", "").strip()
+          if _nv_id.startswith("nvidia/nvidia/"):
+              _nv_id = _nv_id[len("nvidia/"):]
+          _nv_model = ("nvidia/" + _nv_id) if _nv_id else ""
           # The default model is PER-INSTANCE and comes from the
           # opencode/default-models.txt file in this repo: one full
           # model id per line (# comments and blank lines ignored).
@@ -693,7 +777,19 @@ jobs:
               else:
                   break
           _idx = int(_num) - 1 if _num else 0
-          if _or_model:
+          if _nv_model:
+              _nim_id = _nv_id
+              _prov = cfg.setdefault("provider", {})
+              _nvidia = _prov.setdefault("nvidia", {})
+              _nvidia["npm"] = "@ai-sdk/openai-compatible"
+              _nvidia["name"] = "NVIDIA NIM"
+              _nvidia_opts = _nvidia.setdefault("options", {})
+              _nvidia_opts["baseURL"] = "https://integrate.api.nvidia.com/v1"
+              _nvidia_opts["apiKey"] = "{env:NVIDIA_API_KEY}"
+              _nvidia.setdefault("models", {}).setdefault(
+                  _nim_id, {"name": _nim_id})
+              cfg["model"] = _nv_model
+          elif _or_model:
               cfg["model"] = _or_model
           else:
               cfg["model"] = _models[_idx % len(_models)]
@@ -836,21 +932,29 @@ jobs:
                                 ("nemotron", "opencode/nemotron-3.5-lightning-free"),
                                 ("glm", "opencode/glm-5.3-flash-free")):
               councillors.setdefault(cname, {})["model"] = cmodel
-          # Per-run OpenRouter override (same OPENROUTER_MODEL as §4):
-          # EVERY slim seat — agents, council and councillors — on the
-          # chosen model for this run only, and the preset forced to
-          # "free" so these seats are the ones actually used. The
-          # runner's slim config is never committed back, so the next
-          # plain dispatch restores the free-preset seats above.
+          # Per-run provider override (same NVIDIA_MODEL /
+          # OPENROUTER_MODEL as §4, NVIDIA checked first): EVERY slim
+          # seat — agents, council and councillors — on the chosen
+          # model for this run only, and the preset forced to "free"
+          # so these seats are the ones actually used. The runner's
+          # slim config is never committed back, so the next plain
+          # dispatch restores the free-preset seats above.
+          _nv_raw = os.environ.get("NVIDIA_MODEL", "").strip()
           _or_raw = os.environ.get("OPENROUTER_MODEL", "").strip()
-          if _or_raw:
-              _or_model = "openrouter/" + _or_raw if not _or_raw.startswith("openrouter/") else _or_raw
+          _override = ""
+          if _nv_raw:
+              _nv_id = _nv_raw[len("nvidia/"):] \
+                  if _nv_raw.startswith("nvidia/nvidia/") else _nv_raw
+              _override = "nvidia/" + _nv_id
+          elif _or_raw:
+              _override = "openrouter/" + _or_raw if not _or_raw.startswith("openrouter/") else _or_raw
+          if _override:
               for _seat in list(free_preset.values()):
                   if isinstance(_seat, dict):
-                      _seat["model"] = _or_model
+                      _seat["model"] = _override
               for _seat in list(councillors.values()):
                   if isinstance(_seat, dict):
-                      _seat["model"] = _or_model
+                      _seat["model"] = _override
               cfg["preset"] = "free"
           cfg["council"].setdefault("default_preset", "default")
           cfg.setdefault("preset", "free")
@@ -1025,13 +1129,12 @@ def openrouter_account_names(accounts):
     return [a["name"] for a in normalize_openrouter_accounts(accounts)]
 
 
-def move_openrouter_account(accounts, idx, delta):
-    """Move one account by `delta` (-1 up, +1 down) in list order.
-    List order IS the machine mapping, so this only swaps two
-    entries in place — names and tokens travel with their entry,
-    nothing is retyped or dropped. At either end, or for an
-    out-of-range index, it is a no-op. Returns the entry's new
-    index (the old one when nothing moved)."""
+def _move_account_entry(accounts, idx, delta):
+    """Shared list-order move for the provider account dialogs.
+    Swaps two entries in place — names and tokens travel with
+    their entry, nothing is retyped or dropped. At either end, or
+    for an out-of-range index, it is a no-op. Returns the entry's
+    new index (the old one when nothing moved)."""
     if not isinstance(accounts, list):
         return idx
     new_idx = idx + delta
@@ -1040,6 +1143,22 @@ def move_openrouter_account(accounts, idx, delta):
         return idx
     accounts[idx], accounts[new_idx] = accounts[new_idx], accounts[idx]
     return new_idx
+
+
+def move_openrouter_account(accounts, idx, delta):
+    """Move one account by `delta` (-1 up, +1 down) in list order.
+    List order IS the machine mapping, so this only swaps two
+    entries in place — names and tokens travel with their entry,
+    nothing is retyped or dropped. At either end, or for an
+    out-of-range index, it is a no-op. Returns the entry's new
+    index (the old one when nothing moved)."""
+    return _move_account_entry(accounts, idx, delta)
+
+
+def move_nvidia_account(accounts, idx, delta):
+    """Same list-order move as move_openrouter_account, for the
+    NVIDIA accounts: list order IS the machine mapping."""
+    return _move_account_entry(accounts, idx, delta)
 
 
 def free_openrouter_model_ids(payload):
@@ -1128,6 +1247,20 @@ def openrouter_dispatch_inputs(choice):
     return {"openrouter_account": account, "openrouter_model": model}
 
 
+def _account_name_for_instance(wf_name, names):
+    """Account NAME for one machine, by its trailing instance
+    number: machine 1 -> the 1st name in list order, machine 2 ->
+    the 2nd, and so on, WRAPPING modulo the count when there are
+    more machines than accounts (machine 4 with 3 accounts uses
+    the 1st again). A name with no trailing number uses the 1st
+    name. None when no names are configured."""
+    if not names:
+        return None
+    m = re.search(r"(\d+)$", wf_name or "")
+    n = int(m.group(1)) if m else 1
+    return names[(n - 1) % len(names)]
+
+
 def openrouter_account_for_instance(wf_name, accounts):
     """Account NAME for one machine, by its trailing instance
     number: machine 1 -> the 1st account in settings order,
@@ -1137,30 +1270,185 @@ def openrouter_account_for_instance(wf_name, accounts):
     number uses the 1st account. None when no accounts are
     configured. Only the account NAME is ever returned — tokens
     never leave settings.json through this app."""
-    names = openrouter_account_names(accounts)
-    if not names:
-        return None
-    m = re.search(r"(\d+)$", wf_name or "")
-    n = int(m.group(1)) if m else 1
-    return names[(n - 1) % len(names)]
+    return _account_name_for_instance(
+        wf_name, openrouter_account_names(accounts))
 
 
 def openrouter_dispatch_inputs_for_machine(choice, wf, accounts):
     """workflow_dispatch inputs for ONE machine. choice is None /
-    "asis" -> {}; ("per-machine", model) -> the account resolved
-    for wf's instance number + the model, or {} when no account
+    "asis" -> {}; ("per-machine", model) or ("openrouter", model)
+    -> the account resolved for wf's instance number + the model,
+    or {} when no account resolves (the caller must NOT dispatch
+    plain in that case — a silent Zen fallback would hide the
+    misconfiguration); a legacy (account, model) tuple -> that
+    account + model."""
+    if not choice or choice == "asis":
+        return {}
+    if isinstance(choice, tuple) and len(choice) == 2 \
+            and choice[0] in ("per-machine", "openrouter"):
+        account = openrouter_account_for_instance(wf, accounts)
+        if account is None:
+            return {}
+        return {"openrouter_account": account, "openrouter_model": choice[1]}
+    return openrouter_dispatch_inputs(choice)
+
+
+# ---------------------------------------------------------------------------
+# NVIDIA accounts (per-run provider choice at Run time)
+# ---------------------------------------------------------------------------
+# Mirrors the OpenRouter accounts above: same settings shape, same
+# per-machine mapping, same JSON-secret delivery. The one difference
+# is the model list: NVIDIA's catalog needs an API key, so the Run
+# dialog fetches it with the FIRST NVIDIA account's token (from this
+# machine, to NVIDIA's API only — never logged, never sent
+# anywhere else). The catalog lists paid models too with no free
+# mark, so the list is shown as-is and manual typing stays
+# available; a non-free id fails visibly at call time.
+
+NVIDIA_MODELS_URL = "https://integrate.api.nvidia.com/v1/models"
+NVIDIA_KEYS_SECRET = "NVIDIA_KEYS"
+
+
+def blank_nvidia_account():
+    return {"name": "", "token": ""}
+
+
+def normalize_nvidia_accounts(accounts):
+    """Settings-shape NVIDIA accounts: drop entries with no name,
+    trim name/token, keep the FIRST entry per name. Tokens are never
+    logged or echoed anywhere in this app."""
+    seen, out = set(), []
+    for a in accounts or []:
+        if not isinstance(a, dict):
+            continue
+        name = str(a.get("name", "")).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append({"name": name,
+                    "token": str(a.get("token", "")).strip()})
+    return out
+
+
+def nvidia_account_names(accounts):
+    return [a["name"] for a in normalize_nvidia_accounts(accounts)]
+
+
+def nvidia_model_ids(payload):
+    """Model ids from an NVIDIA /v1/models payload (OpenAI-
+    compatible list shape: {"data": [{"id": ...}]}). Sorted,
+    de-duplicated. Entries without a string id are skipped; a
+    missing/non-list `data` yields []. No free filter is applied:
+    the catalog does not mark free endpoints."""
+    ids = set()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    for entry in data or []:
+        if not isinstance(entry, dict):
+            continue
+        mid = entry.get("id")
+        if isinstance(mid, str) and mid:
+            ids.add(mid)
+    return sorted(ids, key=str.casefold)
+
+
+def fetch_nvidia_models(token, urlopen=None, timeout=10):
+    """NVIDIA model ids, live from the NIM catalog, authenticated
+    with the given token (the first configured account's). [] on
+    ANY failure (no/blank token, network, timeout, bad payload) —
+    and with a blank token the opener is never called. The Run
+    dialog then offers manual model entry instead of blocking.
+    The token is sent only to NVIDIA's API, in the Authorization
+    header, and is never logged."""
+    if not isinstance(token, str) or not token.strip():
+        return []
+    opener = urlopen or urllib.request.urlopen
+    try:
+        req = urllib.request.Request(
+            NVIDIA_MODELS_URL,
+            headers={"User-Agent": "Remote-Op",
+                     "Authorization": "Bearer " + token.strip()})
+        with opener(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        return nvidia_model_ids(payload)
+    except Exception:
+        return []
+
+
+def normalize_nvidia_model(raw):
+    """OpenCode model REF for a chosen NVIDIA NIM id: "nvidia/" +
+    the NIM id as listed (e.g. nvidia/nemotron-3-ultra-550b-a55b
+    -> nvidia/nvidia/nemotron-3-ultra-550b-a55b, because the NIM
+    id itself contains a slash). A value already in that triple
+    form is returned unchanged; anything else is taken as the NIM
+    id as-is. "" stays "" (no choice)."""
+    mid = (raw or "").strip()
+    if not mid:
+        return ""
+    if mid.startswith("nvidia/nvidia/"):
+        return mid
+    return "nvidia/" + mid
+
+
+def nvidia_token_from_keys(keys_json, account):
+    """Mirror of the runner-side lookup in step 12c: the token for
+    `account` in a NVIDIA_KEYS JSON object, else None. Malformed
+    JSON, a non-object, or a non-string/empty token all yield None."""
+    try:
+        keys = json.loads(keys_json or "")
+    except Exception:
+        return None
+    if not isinstance(keys, dict):
+        return None
+    token = keys.get(account)
+    return token if isinstance(token, str) and token else None
+
+
+def nvidia_keys_json(accounts):
+    """The NVIDIA_KEYS secret content for the configured accounts:
+    {name: token}. Only accounts with both a name and a token are
+    included; callers copy this to paste into GitHub."""
+    return json.dumps(
+        {a["name"]: a["token"]
+         for a in normalize_nvidia_accounts(accounts)
+         if a["token"]},
+        indent=2, ensure_ascii=False)
+
+
+def nvidia_dispatch_inputs(choice):
+    """workflow_dispatch inputs for an NVIDIA Run choice: None
+    (run as-is) -> no inputs at all; (account, model) -> only the
+    account NAME and the model id. The token is NEVER an input."""
+    if not choice:
+        return {}
+    account, model = choice
+    return {"nvidia_account": account, "nvidia_model": model}
+
+
+def nvidia_account_for_instance(wf_name, accounts):
+    """Account NAME for one machine, by its trailing instance
+    number — the same rule as OpenRouter (machine 1 -> 1st
+    account, wrapping modulo the count). None when no accounts
+    are configured. Only the NAME is ever returned."""
+    return _account_name_for_instance(
+        wf_name, nvidia_account_names(accounts))
+
+
+def nvidia_dispatch_inputs_for_machine(choice, wf, accounts):
+    """workflow_dispatch inputs for ONE machine. choice is None /
+    "asis" -> {}; ("nvidia", model) -> the account resolved for
+    wf's instance number + the model, or {} when no account
     resolves (the caller must NOT dispatch plain in that case — a
     silent Zen fallback would hide the misconfiguration); a legacy
     (account, model) tuple -> that account + model."""
     if not choice or choice == "asis":
         return {}
     if isinstance(choice, tuple) and len(choice) == 2 \
-            and choice[0] == "per-machine":
-        account = openrouter_account_for_instance(wf, accounts)
+            and choice[0] == "nvidia":
+        account = nvidia_account_for_instance(wf, accounts)
         if account is None:
             return {}
-        return {"openrouter_account": account, "openrouter_model": choice[1]}
-    return openrouter_dispatch_inputs(choice)
+        return {"nvidia_account": account, "nvidia_model": choice[1]}
+    return nvidia_dispatch_inputs(choice)
 
 
 # ---------------------------------------------------------------------------
@@ -1213,6 +1501,9 @@ def load_settings(path=None):
             if isinstance(data, dict) else False,
             "openrouter_accounts": normalize_openrouter_accounts(
                 data.get("openrouter_accounts"))
+            if isinstance(data, dict) else [],
+            "nvidia_accounts": normalize_nvidia_accounts(
+                data.get("nvidia_accounts"))
             if isinstance(data, dict) else []}
 
 
@@ -2018,6 +2309,7 @@ class App:
         self.repo_combo.bind("<<ComboboxSelected>>", self._on_repo_switch)
         ttk.Button(top, text="Repos…", command=self._repos_dialog).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="OpenRouter accounts…", command=self._openrouter_dialog).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="NVIDIA accounts…", command=self._nvidia_dialog).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="↻ Refresh", command=self.refresh).pack(side=tk.LEFT, padx=2)
         self.status_var = tk.StringVar(value="")
         tk.Label(top, textvariable=self.status_var, bg=BG,
@@ -2583,19 +2875,32 @@ class App:
         if run.get("status") in ("in_progress", "queued"):
             self.log(f"{cfg['label']}/{wf}: already {run['status']} — skipped")
             return
-        inputs = openrouter_dispatch_inputs_for_machine(
-            choice, wf, self.settings.get("openrouter_accounts", []))
-        if choice and isinstance(choice, tuple) and choice[0] == "per-machine" \
-                and not inputs:
-            self.log(f"{cfg['label']}/{wf}: no OpenRouter account "
-                     f"configured — add accounts in 'OpenRouter "
+        or_accounts = self.settings.get("openrouter_accounts", [])
+        nv_accounts = self.settings.get("nvidia_accounts", [])
+        is_nvidia = isinstance(choice, tuple) and bool(choice) \
+            and choice[0] == "nvidia"
+        if is_nvidia:
+            inputs = nvidia_dispatch_inputs_for_machine(
+                choice, wf, nv_accounts)
+        else:
+            inputs = openrouter_dispatch_inputs_for_machine(
+                choice, wf, or_accounts)
+        if isinstance(choice, tuple) and choice and not inputs:
+            provider = "NVIDIA" if is_nvidia else "OpenRouter"
+            self.log(f"{cfg['label']}/{wf}: no {provider} account "
+                     f"configured — add accounts in '{provider} "
                      f"accounts…' or run as-is; NOT dispatched")
             return
         if GH(cfg["pat"]).dispatch(cfg["repo"], cfg["branch"], info["file"], inputs):
             if inputs:
+                account = inputs.get("nvidia_account") \
+                    or inputs.get("openrouter_account")
+                model = inputs.get("nvidia_model") \
+                    or inputs.get("openrouter_model")
+                provider = "NVIDIA" if "nvidia_account" in inputs \
+                    else "OpenRouter"
                 self.log(f"{cfg['label']}/{wf}: dispatched "
-                         f"(OpenRouter: {inputs['openrouter_account']} / "
-                         f"{inputs['openrouter_model']})")
+                         f"({provider}: {account} / {model})")
             else:
                 self.log(f"{cfg['label']}/{wf}: dispatched")
         else:
@@ -2615,11 +2920,11 @@ class App:
         if not targets:
             self.log("nothing checked — tick the machines to run first")
             return
-        picked = self._openrouter_run_dialog(targets)
+        picked = self._provider_run_dialog(targets)
         if picked is None:
             self.log("run cancelled — nothing dispatched")
             return
-        choice = None if picked == "asis" else ("per-machine", picked)
+        choice = None if picked == "asis" else picked
 
         def work():
             self._dispatch_many(targets, choice)
@@ -2633,11 +2938,11 @@ class App:
         if not targets:
             self.log(f"{cfg['label']}: no machines loaded")
             return
-        picked = self._openrouter_run_dialog(targets)
+        picked = self._provider_run_dialog(targets)
         if picked is None:
             self.log("run cancelled — nothing dispatched")
             return
-        choice = None if picked == "asis" else ("per-machine", picked)
+        choice = None if picked == "asis" else picked
 
         def work():
             self._dispatch_many(targets, choice)
@@ -3200,55 +3505,91 @@ class App:
         self.bg(work)
 
     # -- run choice dialog ------------------------------------------------------------
-    def _openrouter_run_dialog(self, targets=None):
-        """Pick ONLY the model for this Run action. The account is
-        NOT picked here: each machine uses the account matching its
-        instance number (machine 1 -> 1st account in settings order,
-        machine 2 -> 2nd, wrapping — see
-        openrouter_account_for_instance), and the preview below
-        shows the mapping for the machines about to run.
+    def _provider_run_dialog(self, targets=None):
+        """Pick the PROVIDER and model for this Run action, once for
+        every machine it dispatches. The account is NOT picked here:
+        each machine uses the account matching its instance number
+        (machine 1 -> 1st account in that provider's settings order,
+        machine 2 -> 2nd, wrapping), and the preview shows the
+        mapping for the selected provider.
 
-        Returns None (cancel — nothing is dispatched), "asis" (run
-        with the current Zen setup, no inputs), or the OpenRouter
-        model slug for this run only. The token is never part of
-        the return value: the runner reads it from the
-        OPENROUTER_KEYS secret. The free-model list loads in the
-        background; if it fails, manual entry still works and the
-        dialog never blocks the run."""
-        accounts = normalize_openrouter_accounts(
+        Returns None (cancel — nothing is dispatched), "asis"
+        (OpenCode/Zen: the current per-instance setup, no inputs),
+        ("openrouter", model), or ("nvidia", model) — the provider
+        and the model slug for this run only. Tokens are never part
+        of the return value: the runner reads them from the
+        provider's KEYS secret. Each provider's model list loads in
+        the background (NVIDIA's with the first NVIDIA account's
+        token, to NVIDIA's API only); if a list fails, manual entry
+        still works and the dialog never blocks the run."""
+        or_accounts = normalize_openrouter_accounts(
             self.settings.get("openrouter_accounts", []))
-        names = [a["name"] for a in accounts]
+        nv_accounts = normalize_nvidia_accounts(
+            self.settings.get("nvidia_accounts", []))
+        or_names = [a["name"] for a in or_accounts]
+        nv_names = [a["name"] for a in nv_accounts]
         result = {"value": None}
         win = tk.Toplevel(self.root)
         win.title("Run machines")
-        win.geometry("560x500")
+        win.geometry("560x540")
         win.transient(self.root)
+
+        tk.Label(win, text="Provider (this run only):",
+                 anchor="w").pack(fill=tk.X, padx=10, pady=(10, 2))
+        provider_var = tk.StringVar(value="openrouter")
+        radios = tk.Frame(win)
+        radios.pack(fill=tk.X, padx=10)
+        for _value, _label in (
+                ("opencode", "OpenCode (Zen — current setup)"),
+                ("openrouter", "OpenRouter"),
+                ("nvidia", "NVIDIA")):
+            ttk.Radiobutton(radios, text=_label, variable=provider_var,
+                            value=_value).pack(side=tk.LEFT, padx=4)
 
         tk.Label(win, text="Account per machine (automatic — not picked "
                           "here): machine 1 → 1st account, machine 2 → "
                           "2nd, and so on (wraps). Reorder accounts in "
-                          "'OpenRouter accounts…' (top bar).",
+                          "the provider's accounts dialog (top bar).",
                  fg="#666", wraplength=520, justify="left",
-                 anchor="w").pack(fill=tk.X, padx=10, pady=(10, 2))
-        if targets and names:
-            seen = []
-            for _cfg, _wf in targets:
-                if _wf not in seen:
-                    seen.append(_wf)
-            preview = ", ".join(
-                f"{wf} → {openrouter_account_for_instance(wf, accounts)}"
-                for wf in seen[:10])
-            if len(seen) > 10:
-                preview += f", … (+{len(seen) - 10} more)"
-            tk.Label(win, text="This run: " + preview, wraplength=520,
-                     justify="left", anchor="w").pack(fill=tk.X, padx=10)
-        elif not names:
-            tk.Label(win, text="No OpenRouter accounts yet — add them in "
-                              "'OpenRouter accounts…' (top bar), or run "
-                              "as-is below.", fg="#666", wraplength=520,
-                     justify="left").pack(fill=tk.X, padx=10, pady=2)
+                 anchor="w").pack(fill=tk.X, padx=10, pady=(6, 2))
+        preview_var = tk.StringVar()
+        tk.Label(win, textvariable=preview_var, wraplength=520,
+                 justify="left", anchor="w").pack(fill=tk.X, padx=10)
 
-        tk.Label(win, text="Free model (live list, or type an id below):",
+        def update_preview():
+            provider = provider_var.get()
+            if provider == "opencode":
+                preview_var.set("Zen: each machine keeps its per-instance "
+                                "model (default-models.txt / variable / "
+                                "built-in list). No inputs are sent.")
+                return
+            accounts = or_accounts if provider == "openrouter" \
+                else nv_accounts
+            resolver = openrouter_account_for_instance \
+                if provider == "openrouter" \
+                else nvidia_account_for_instance
+            names = or_names if provider == "openrouter" else nv_names
+            dialog = "OpenRouter" if provider == "openrouter" else "NVIDIA"
+            if targets and names:
+                seen = []
+                for _cfg, _wf in targets:
+                    if _wf not in seen:
+                        seen.append(_wf)
+                preview = ", ".join(
+                    f"{wf} → {resolver(wf, accounts)}" for wf in seen[:10])
+                if len(seen) > 10:
+                    preview += f", … (+{len(seen) - 10} more)"
+                preview_var.set("This run: " + preview)
+            elif not names:
+                preview_var.set(f"No {dialog} accounts yet — add them in "
+                                f"'{dialog} accounts…' (top bar), or pick "
+                                "OpenCode above.")
+            else:
+                preview_var.set("")
+
+        list_label_var = tk.StringVar(
+            value="Free model (live list, or type an id below):")
+        tk.Label(win, textvariable=list_label_var,
                  anchor="w").pack(fill=tk.X, padx=10, pady=(10, 2))
         search_var = tk.StringVar()
         tk.Entry(win, textvariable=search_var).pack(fill=tk.X, padx=10)
@@ -3257,34 +3598,86 @@ class App:
         status_var = tk.StringVar(value="Loading free models…")
         tk.Label(win, textvariable=status_var, fg="#666",
                  anchor="w").pack(fill=tk.X, padx=10)
-        state = {"models": []}
+        # Per-provider lists: None = not loaded yet. NVIDIA's list is
+        # fetched with the first NVIDIA account's token (to NVIDIA's
+        # API only, never logged); OpenRouter's needs no key.
+        state = {"openrouter": None, "nvidia": None, "loading": set()}
 
         def refill():
+            provider = provider_var.get()
+            models = state.get(provider) or []
             q = search_var.get().strip().casefold()
             lb.delete(0, tk.END)
-            for mid in state["models"]:
+            for mid in models:
                 if q and q not in mid.casefold():
                     continue
                 lb.insert(tk.END, mid)
 
         search_var.trace_add("write", lambda *_a: refill())
 
-        def load_models():
-            models = fetch_openrouter_models()
+        def load_models(provider):
+            if provider == "opencode" or provider in state["loading"]:
+                return
+            if state.get(provider) is not None:
+                return
+            state["loading"].add(provider)
 
-            def done():
-                if not win.winfo_exists():
-                    return
-                state["models"] = models
-                if models:
-                    status_var.set(f"{len(models)} free models")
+            def work():
+                if provider == "openrouter":
+                    models = fetch_openrouter_models()
                 else:
-                    status_var.set("Could not load the model list — "
-                                   "type a model ID instead.")
-                refill()
-            self.root.after(0, done)
+                    token = nv_accounts[0]["token"] if nv_accounts else ""
+                    models = fetch_nvidia_models(token)
 
-        threading.Thread(target=load_models, daemon=True).start()
+                def done():
+                    state["loading"].discard(provider)
+                    if not win.winfo_exists():
+                        return
+                    state[provider] = models
+                    if provider_var.get() == provider:
+                        if models:
+                            status_var.set(f"{len(models)} models")
+                        else:
+                            status_var.set("Could not load the model "
+                                           "list — type a model ID "
+                                           "instead.")
+                        refill()
+                self.root.after(0, done)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def on_provider_change(*_a):
+            provider = provider_var.get()
+            update_preview()
+            if provider == "opencode":
+                list_label_var.set(
+                    "Model: none to pick for OpenCode (Zen).")
+                status_var.set("Run uses each machine's Zen model.")
+                lb.delete(0, tk.END)
+            elif provider == "openrouter":
+                list_label_var.set(
+                    "Free model (live list, or type an id below):")
+                loaded = state.get("openrouter")
+                status_var.set("Loading free models…" if loaded is None
+                               else f"{len(loaded)} free models")
+                refill()
+                load_models("openrouter")
+            else:
+                list_label_var.set(
+                    "NVIDIA model (live list, or type an id below):")
+                if not nv_names:
+                    status_var.set("No NVIDIA accounts — add one first, "
+                                   "or pick OpenCode.")
+                    lb.delete(0, tk.END)
+                else:
+                    loaded = state.get("nvidia")
+                    status_var.set("Loading NVIDIA models…"
+                                   if loaded is None
+                                   else f"{len(loaded)} models")
+                    refill()
+                    load_models("nvidia")
+
+        provider_var.trace_add("write", on_provider_change)
 
         tk.Label(win, text="Or type a model ID (wins over the list):",
                  anchor="w").pack(fill=tk.X, padx=10, pady=(6, 2))
@@ -3295,31 +3688,37 @@ class App:
             result["value"] = value
             win.destroy()
 
-        def run_openrouter():
+        def run_provider():
+            provider = provider_var.get()
+            if provider == "opencode":
+                finish("asis")
+                return
+            names = or_names if provider == "openrouter" else nv_names
             if not names:
-                status_var.set("No OpenRouter accounts — add them in "
-                               "'OpenRouter accounts…' first, "
-                               "or run as-is.")
+                dialog = "OpenRouter" if provider == "openrouter" \
+                    else "NVIDIA"
+                status_var.set(f"No {dialog} accounts — add them in "
+                               f"'{dialog} accounts…' first, "
+                               "or pick OpenCode.")
                 return
             model = manual_var.get().strip()
             if not model:
                 sel = lb.curselection()
                 if not sel:
                     status_var.set("Pick a model, type a model ID, "
-                                   "or run as-is.")
+                                   "or pick OpenCode.")
                     return
                 model = lb.get(sel[0])
-            finish(model)
+            finish((provider, model))
 
         btns = tk.Frame(win)
         btns.pack(fill=tk.X, padx=10, pady=10)
-        ttk.Button(btns, text="▶ Run with OpenRouter",
+        ttk.Button(btns, text="▶ Run",
                    style="Accent.TButton",
-                   command=run_openrouter).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btns, text="Run as-is (current Zen setup)",
-                   command=lambda: finish("asis")).pack(side=tk.LEFT, padx=2)
+                   command=run_provider).pack(side=tk.LEFT, padx=2)
         ttk.Button(btns, text="Cancel",
                    command=lambda: finish(None)).pack(side=tk.LEFT, padx=2)
+        on_provider_change()
         win.protocol("WM_DELETE_WINDOW", lambda: finish(None))
         win.grab_set()
         win.wait_window()
@@ -3586,6 +3985,172 @@ class App:
                 return
             self.log(f"OpenRouter accounts saved "
                      f"({len(self.settings['openrouter_accounts'])} account(s); "
+                     f"tokens are never logged).")
+            win.destroy()
+
+        tk.Button(btns, text="New", command=new_account).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Delete", command=del_account).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Move up",
+                  command=lambda: move_account(-1)).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Move down",
+                  command=lambda: move_account(1)).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Copy JSON for GitHub Secret",
+                  command=copy_json).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Save & close",
+                  command=save_close).pack(side=tk.LEFT, padx=10)
+        if accounts:
+            lb.selection_set(0)
+            load_fields(0)
+        else:
+            new_account()
+
+    # -- nvidia accounts dialog ---------------------------------------------------------
+    def _nvidia_dialog(self):
+        """Manage the NVIDIA accounts stored in settings.json
+        (name + token, like the OpenRouter accounts). The LIST
+        ORDER is the machine mapping: machine 1 uses the 1st
+        account, machine 2 the 2nd, and so on (wrapping) — the Run
+        dialog picks the provider + model only. The token is NEVER
+        sent by this app at dispatch and never logged: the runner
+        reads it from the NVIDIA_KEYS GitHub Secret, and Remote-Op
+        sends only the account name + model. 'Copy JSON' builds
+        that secret's content from these accounts for pasting into
+        GitHub — set the secret yourself, in each fleet repo. The
+        FIRST account's token is also used, from this machine only,
+        to fetch the live NVIDIA model list in the Run dialog."""
+        accounts = self.settings.setdefault("nvidia_accounts", [])
+        self.settings["nvidia_accounts"] = normalize_nvidia_accounts(accounts)
+        accounts = self.settings["nvidia_accounts"]
+        win = tk.Toplevel(self.root)
+        win.title("NVIDIA accounts")
+        win.geometry("720x400")
+        lb = tk.Listbox(win, width=24)
+        lb.pack(side=tk.LEFT, fill=tk.Y, padx=6, pady=6)
+        for a in accounts:
+            lb.insert(tk.END, a["name"])
+
+        form = tk.Frame(win)
+        form.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=6, pady=6)
+        vars_ = {}
+        rows = [("name", "Name", 30, False),
+                ("token", "Token", 46, True)]
+        for key, title, w, secret in rows:
+            r = tk.Frame(form)
+            r.pack(fill=tk.X, pady=2)
+            tk.Label(r, text=title, width=12, anchor="w").pack(side=tk.LEFT)
+            v = tk.StringVar()
+            tk.Entry(r, textvariable=v, width=w,
+                     show="•" if secret else "").pack(side=tk.LEFT)
+            vars_[key] = v
+        tk.Label(form, text="Tokens live in settings.json next to the exe "
+                            "(like PATs — keep the file private) and are "
+                            "never sent at dispatch. The runner reads the "
+                            "token from the NVIDIA_KEYS GitHub Secret "
+                            "(JSON: name -> token), which you set yourself "
+                            "in each fleet repo. 'Copy JSON' builds that "
+                            "secret's content from the accounts here. "
+                            "ORDER MATTERS: machine 1 uses the 1st account "
+                            "in this list, machine 2 the 2nd, and so on "
+                            "(wrapping when there are more machines than "
+                            "accounts) — reorder with Move up / Move down, "
+                            "without retyping a token. The first "
+                            "account's token is also used to fetch the "
+                            "live NVIDIA model list (to NVIDIA's API "
+                            "only, never logged).",
+                 fg="#666", wraplength=430,
+                 justify="left").pack(anchor="w", pady=4)
+        state = {"idx": None}
+
+        def load_fields(idx):
+            state["idx"] = idx
+            a = accounts[idx] if idx is not None else blank_nvidia_account()
+            for k, v in vars_.items():
+                v.set(a.get(k, ""))
+
+        def flush():
+            if state["idx"] is None:
+                return
+            a = accounts[state["idx"]]
+            for k, v in vars_.items():
+                a[k] = v.get().strip()
+
+        def on_select(_evt=None):
+            flush()
+            sel = lb.curselection()
+            if sel:
+                load_fields(sel[0])
+
+        lb.bind("<<ListboxSelect>>", on_select)
+
+        btns = tk.Frame(form)
+        btns.pack(fill=tk.X, pady=8)
+
+        def new_account():
+            flush()
+            accounts.append(blank_nvidia_account())
+            lb.insert(tk.END, "")
+            lb.selection_clear(0, tk.END)
+            lb.selection_set(tk.END)
+            load_fields(len(accounts) - 1)
+
+        def del_account():
+            sel = lb.curselection()
+            if not sel:
+                return
+            del accounts[sel[0]]
+            lb.delete(sel[0])
+            state["idx"] = None
+            load_fields(None)
+
+        def move_account(delta):
+            sel = lb.curselection()
+            if not sel:
+                return
+            flush()
+            new_idx = move_nvidia_account(accounts, sel[0], delta)
+            if new_idx == sel[0]:
+                return
+            lb.delete(0, tk.END)
+            for a in accounts:
+                lb.insert(tk.END, a["name"])
+            lb.selection_clear(0, tk.END)
+            lb.selection_set(new_idx)
+            load_fields(new_idx)
+
+        def copy_json():
+            flush()
+            text = nvidia_keys_json(accounts)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.log("NVIDIA_KEYS JSON copied — paste it as the "
+                     "NVIDIA_KEYS secret in each fleet repo "
+                     "(token values are never logged).")
+
+        def save_close():
+            if state["idx"] is None and any(
+                    v.get().strip() for v in vars_.values()):
+                accounts.append(blank_nvidia_account())
+                lb.insert(tk.END, "")
+                state["idx"] = len(accounts) - 1
+            flush()
+            kept = [a for a in accounts if a.get("name")]
+            names = [a["name"] for a in kept]
+            if len(names) != len(set(names)):
+                messagebox.showerror(
+                    "Remote-Op",
+                    "Account names must be unique — rename the duplicate "
+                    "before saving.")
+                return
+            self.settings["nvidia_accounts"] = normalize_nvidia_accounts(kept)
+            try:
+                save_settings(self.settings)
+            except OSError as e:
+                messagebox.showerror(
+                    "Remote-Op",
+                    f"Could not save settings:\n{SETTINGS_PATH}\n\n{e}")
+                return
+            self.log(f"NVIDIA accounts saved "
+                     f"({len(self.settings['nvidia_accounts'])} account(s); "
                      f"tokens are never logged).")
             win.destroy()
 

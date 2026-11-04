@@ -678,6 +678,9 @@ assert app.openrouter_dispatch_inputs_for_machine(
     ("per-machine", "m:free"), "syd2", _accts) == {
         "openrouter_account": "a2", "openrouter_model": "m:free"}
 assert app.openrouter_dispatch_inputs_for_machine(
+    ("openrouter", "m:free"), "syd2", _accts) == {
+        "openrouter_account": "a2", "openrouter_model": "m:free"}
+assert app.openrouter_dispatch_inputs_for_machine(
     ("per-machine", "m:free"), "syd1", []) == {}
 assert app.openrouter_dispatch_inputs_for_machine(None, "syd1", _accts) == {}
 assert app.openrouter_dispatch_inputs_for_machine("asis", "syd1", _accts) == {}
@@ -701,6 +704,155 @@ assert app.move_openrouter_account(_re, 0, 1) == 1
 assert app.openrouter_account_for_instance("syd1", _re) == "a1"
 assert app.openrouter_account_for_instance("syd2", _re) == "a2"
 print("openrouter account reorder OK")
+
+# --- NVIDIA provider choice ---------------------------------------------------
+# settings: accounts migrate, round-trip, dedupe/drop malformed
+with tempfile.TemporaryDirectory() as td:
+    p = os.path.join(td, "settings.json")
+    with open(p, "w") as f:
+        json.dump({"repos": [], "nvidia_accounts": [
+            {"name": " nv1 ", "token": " nvapi-1 "},
+            {"name": "nv1", "token": "dup"},
+            {"name": "", "token": "noname"},
+            {"name": "nv2", "token": ""},
+            "junk", None]}, f)
+    s = app.load_settings(p)
+    assert s["nvidia_accounts"] == [
+        {"name": "nv1", "token": "nvapi-1"},
+        {"name": "nv2", "token": ""}], s["nvidia_accounts"]
+    app.save_settings(s, p)
+    assert app.load_settings(p)["nvidia_accounts"] == s["nvidia_accounts"]
+    with open(p, "w") as f:
+        json.dump({"repo": "haileen5/my-opencode", "password": "pw"}, f)
+    assert app.load_settings(p)["nvidia_accounts"] == []
+print("nvidia settings migration OK")
+
+# model ids: OpenAI-compatible list shape, no free filter
+_nv_payload = {"data": [
+    {"id": "nvidia/nemotron-3-ultra-550b-a55b"},
+    {"id": "google/gemma-4-31b-it"},
+    {"id": ""},
+    {"id": 7},
+    "junk",
+    {"no-id": True},
+    {"id": "nvidia/nemotron-3-ultra-550b-a55b"}]}
+assert app.nvidia_model_ids(_nv_payload) == [
+    "google/gemma-4-31b-it", "nvidia/nemotron-3-ultra-550b-a55b"]
+assert app.nvidia_model_ids({}) == []
+assert app.nvidia_model_ids({"data": "junk"}) == []
+print("nvidia model ids OK")
+
+
+class _NvResp:
+    def __init__(self, body):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return self._body
+
+
+_nv_seen = {}
+
+
+def _nv_ok_opener(req, timeout=10):
+    _nv_seen["url"] = req.full_url
+    _nv_seen["auth"] = [v for v in req.headers.values()
+                        if v.startswith("Bearer ")]
+    return _NvResp(json.dumps(_nv_payload).encode())
+
+
+assert app.fetch_nvidia_models("nvapi-test", urlopen=_nv_ok_opener) == [
+    "google/gemma-4-31b-it", "nvidia/nemotron-3-ultra-550b-a55b"]
+assert _nv_seen["url"] == app.NVIDIA_MODELS_URL
+assert _nv_seen["auth"] == ["Bearer nvapi-test"], _nv_seen
+
+
+def _nv_never_opener(req, timeout=10):
+    raise AssertionError("opener must not be called with a blank token")
+
+
+assert app.fetch_nvidia_models("", urlopen=_nv_never_opener) == []
+assert app.fetch_nvidia_models("   ", urlopen=_nv_never_opener) == []
+assert app.fetch_nvidia_models(None, urlopen=_nv_never_opener) == []
+assert app.fetch_nvidia_models("nvapi-test", urlopen=_bad_opener) == []
+assert app.fetch_nvidia_models("nvapi-test", urlopen=_junk_opener) == []
+print("nvidia fetch (auth header + failure -> []) OK")
+
+# model normalization + secret lookup mirror + keys JSON + dispatch inputs
+assert app.normalize_nvidia_model(
+    "nvidia/nemotron-3-ultra-550b-a55b") == "nvidia/nvidia/nemotron-3-ultra-550b-a55b"
+assert app.normalize_nvidia_model(
+    "nvidia/nvidia/nemotron-3-ultra-550b-a55b") == "nvidia/nvidia/nemotron-3-ultra-550b-a55b"
+assert app.normalize_nvidia_model("  google/gemma-4-31b-it  ") == "nvidia/google/gemma-4-31b-it"
+assert app.normalize_nvidia_model("") == "" and app.normalize_nvidia_model(None) == ""
+_nv_keys = '{"nv1": "nvapi-1", "nv2": ""}'
+assert app.nvidia_token_from_keys(_nv_keys, "nv1") == "nvapi-1"
+assert app.nvidia_token_from_keys(_nv_keys, "nv2") is None
+assert app.nvidia_token_from_keys(_nv_keys, "nope") is None
+assert app.nvidia_token_from_keys("{broken", "nv1") is None
+assert app.nvidia_token_from_keys("[1,2]", "nv1") is None
+assert app.nvidia_token_from_keys('{"nv1": 7}', "nv1") is None
+assert json.loads(app.nvidia_keys_json(
+    [{"name": "nv1", "token": "nvapi-1"}, {"name": "nv2", "token": ""}])) == {"nv1": "nvapi-1"}
+assert app.nvidia_dispatch_inputs(None) == {}
+assert app.nvidia_dispatch_inputs(("nv1", "nvidia/nemotron-3-ultra-550b-a55b")) == {
+    "nvidia_account": "nv1", "nvidia_model": "nvidia/nemotron-3-ultra-550b-a55b"}
+print("nvidia normalize/lookup/inputs OK")
+
+# per-machine account mapping with 5 accounts: machine 6 wraps to the 1st
+_nv_accts = [{"name": f"n{i}", "token": f"t{i}"} for i in range(1, 6)]
+assert app.nvidia_account_for_instance("syd1", _nv_accts) == "n1"
+assert app.nvidia_account_for_instance("syd5", _nv_accts) == "n5"
+assert app.nvidia_account_for_instance("syd6", _nv_accts) == "n1"  # wraps
+assert app.nvidia_account_for_instance("sad11", _nv_accts) == "n1"  # (11-1)%5
+assert app.nvidia_account_for_instance("op", _nv_accts) == "n1"  # no number
+assert app.nvidia_account_for_instance("syd1", []) is None
+assert app.nvidia_dispatch_inputs_for_machine(
+    ("nvidia", "m1"), "syd2", _nv_accts) == {
+        "nvidia_account": "n2", "nvidia_model": "m1"}
+assert app.nvidia_dispatch_inputs_for_machine(
+    ("nvidia", "m1"), "syd6", _nv_accts) == {
+        "nvidia_account": "n1", "nvidia_model": "m1"}
+assert app.nvidia_dispatch_inputs_for_machine(
+    ("nvidia", "m1"), "syd1", []) == {}
+assert app.nvidia_dispatch_inputs_for_machine(None, "syd1", _nv_accts) == {}
+assert app.nvidia_dispatch_inputs_for_machine("asis", "syd1", _nv_accts) == {}
+assert app.nvidia_dispatch_inputs_for_machine(
+    ("nv9", "m1"), "syd1", _nv_accts) == {
+        "nvidia_account": "nv9", "nvidia_model": "m1"}
+print("nvidia per-machine account mapping OK")
+
+# reorder helper mirrors the OpenRouter one (whole-entry swap, ends no-op)
+_nv_re = [{"name": "n1", "token": "t1"}, {"name": "n2", "token": "t2"},
+          {"name": "n3", "token": "t3"}]
+assert app.move_nvidia_account(_nv_re, 1, -1) == 0
+assert [a["name"] for a in _nv_re] == ["n2", "n1", "n3"]
+assert [a["token"] for a in _nv_re] == ["t2", "t1", "t3"]
+assert app.move_nvidia_account(_nv_re, 0, -1) == 0  # top: no-op
+assert app.move_nvidia_account(_nv_re, 2, 1) == 2  # bottom: no-op
+assert app.move_nvidia_account(_nv_re, 0, 1) == 1
+assert app.nvidia_account_for_instance("syd2", _nv_re) == "n2"
+print("nvidia account reorder OK")
+
+# template: nvidia inputs, step 12c fail-fast lookup, §4 provider block,
+# §4c seat override; OpenRouter + plain paths intact, 9router untouched
+assert "nvidia_account:" in _t and "nvidia_model:" in _t
+assert "12c. Resolve NVIDIA account for this run only" in _t
+assert "NVIDIA_KEYS" in _t and "NVIDIA_API_KEY" in _t
+assert 'if: inputs.nvidia_account != ' in _t
+assert 'os.environ.get("NVIDIA_MODEL"' in _t
+assert "@ai-sdk/openai-compatible" in _t
+assert "integrate.api.nvidia.com/v1" in _t
+assert "{env:NVIDIA_API_KEY}" in _t
+assert _t.count("::add-mask::") == 2  # step 12b + step 12c
+assert "nvapi-" not in _t  # no token literal anywhere in the template
+print("nvidia template (inputs + 12c + §4 provider block + §4c override) OK")
 
 print("openrouter template (inputs + 12b + §4/§4c override) OK")
 
