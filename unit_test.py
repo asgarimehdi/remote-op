@@ -850,9 +850,234 @@ assert 'os.environ.get("NVIDIA_MODEL"' in _t
 assert "@ai-sdk/openai-compatible" in _t
 assert "integrate.api.nvidia.com/v1" in _t
 assert "{env:NVIDIA_API_KEY}" in _t
-assert _t.count("::add-mask::") == 2  # step 12b + step 12c
+assert _t.count("::add-mask::") == 3  # steps 12b + 12c + 12d
 assert "nvapi-" not in _t  # no token literal anywhere in the template
 print("nvidia template (inputs + 12c + §4 provider block + §4c override) OK")
+
+# --- Custom presets ---------------------------------------------------------------
+# settings: presets migrate, round-trip, dedupe/drop malformed
+with tempfile.TemporaryDirectory() as td:
+    p = os.path.join(td, "settings.json")
+    with open(p, "w") as f:
+        json.dump({"repos": [], "custom_presets": [
+            {"name": " c1 ", "base_url": " https://api.example.com/ ",
+             "model": " vendor/m1 ", "token": " tok-1 "},
+            {"name": "c1", "base_url": "dup", "model": "dup", "token": "dup"},
+            {"name": "", "base_url": "x", "model": "y", "token": "noname"},
+            {"name": "c2", "base_url": "", "model": "", "token": ""},
+            "junk", None]}, f)
+    s = app.load_settings(p)
+    assert s["custom_presets"] == [
+        {"name": "c1", "base_url": "https://api.example.com/",
+         "model": "vendor/m1", "token": "tok-1"},
+        {"name": "c2", "base_url": "", "model": "", "token": ""}], s["custom_presets"]
+    app.save_settings(s, p)
+    assert app.load_settings(p)["custom_presets"] == s["custom_presets"]
+    with open(p, "w") as f:
+        json.dump({"repo": "haileen5/my-opencode", "password": "pw"}, f)
+    assert app.load_settings(p)["custom_presets"] == []
+print("custom settings migration OK")
+
+# base-URL normalization: models URL vs provider baseURL
+assert app.custom_models_url("https://api.example.com") == "https://api.example.com/v1/models"
+assert app.custom_models_url("https://api.example.com/") == "https://api.example.com/v1/models"
+assert app.custom_models_url("https://api.example.com/v1") == "https://api.example.com/v1/models"
+assert app.custom_models_url("https://api.example.com/v1/models") == "https://api.example.com/v1/models"
+assert app.custom_models_url("") == "" and app.custom_models_url(None) == ""
+assert app.custom_provider_base_url("https://api.example.com") == "https://api.example.com/v1"
+assert app.custom_provider_base_url("https://api.example.com/") == "https://api.example.com/v1"
+assert app.custom_provider_base_url("https://api.example.com/v1") == "https://api.example.com/v1"
+assert app.custom_provider_base_url("https://api.example.com/v1/models") == "https://api.example.com/v1"
+assert app.custom_provider_base_url("") == "" and app.custom_provider_base_url(None) == ""
+print("custom base-URL normalization OK")
+
+# model ids: OpenAI-compatible list shape, no free filter
+_cu_payload = {"data": [
+    {"id": "vendor/model-a"},
+    {"id": "vendor/model-b"},
+    {"id": ""},
+    {"id": 7},
+    "junk",
+    {"no-id": True},
+    {"id": "vendor/model-a"}]}
+assert app.custom_model_ids(_cu_payload) == ["vendor/model-a", "vendor/model-b"]
+assert app.custom_model_ids({}) == []
+assert app.custom_model_ids({"data": "junk"}) == []
+print("custom model ids OK")
+
+
+class _CuResp:
+    def __init__(self, body):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return self._body
+
+
+_cu_seen = {}
+
+
+def _cu_ok_opener(req, timeout=10):
+    _cu_seen["url"] = req.full_url
+    _cu_seen["auth"] = [v for v in req.headers.values()
+                        if v.startswith("Bearer ")]
+    return _CuResp(json.dumps(_cu_payload).encode())
+
+
+assert app.fetch_custom_models("https://api.example.com", "tok-1",
+                               urlopen=_cu_ok_opener) == [
+    "vendor/model-a", "vendor/model-b"]
+assert _cu_seen["url"] == "https://api.example.com/v1/models"
+assert _cu_seen["auth"] == ["Bearer tok-1"], _cu_seen
+# a base URL that already ends in /v1 fetches from the same /v1/models
+assert app.fetch_custom_models("https://api.example.com/v1", "tok-1",
+                               urlopen=_cu_ok_opener) == [
+    "vendor/model-a", "vendor/model-b"]
+assert _cu_seen["url"] == "https://api.example.com/v1/models"
+
+
+def _cu_never_opener(req, timeout=10):
+    raise AssertionError("opener must not be called with a blank base URL or token")
+
+
+assert app.fetch_custom_models("", "tok-1", urlopen=_cu_never_opener) == []
+assert app.fetch_custom_models("https://api.example.com", "",
+                               urlopen=_cu_never_opener) == []
+assert app.fetch_custom_models("https://api.example.com", "   ",
+                               urlopen=_cu_never_opener) == []
+assert app.fetch_custom_models("", "", urlopen=_cu_never_opener) == []
+assert app.fetch_custom_models("https://api.example.com", "tok-1",
+                               urlopen=_bad_opener) == []
+assert app.fetch_custom_models("https://api.example.com", "tok-1",
+                               urlopen=_junk_opener) == []
+print("custom fetch (URL + auth header + failure -> []) OK")
+
+# model normalization + secret lookup mirror + keys JSON + dispatch inputs
+assert app.normalize_custom_model("vendor/model") == "custom/vendor/model"
+assert app.normalize_custom_model("custom/vendor/model") == "custom/vendor/model"
+assert app.normalize_custom_model("  vendor/model  ") == "custom/vendor/model"
+assert app.normalize_custom_model("") == "" and app.normalize_custom_model(None) == ""
+_cu_keys = '{"c1": "tok-1", "c2": ""}'
+assert app.custom_token_from_keys(_cu_keys, "c1") == "tok-1"
+assert app.custom_token_from_keys(_cu_keys, "c2") is None
+assert app.custom_token_from_keys(_cu_keys, "nope") is None
+assert app.custom_token_from_keys("{broken", "c1") is None
+assert app.custom_token_from_keys("[1,2]", "c1") is None
+assert app.custom_token_from_keys('{"c1": 7}', "c1") is None
+assert json.loads(app.custom_keys_json(
+    [{"name": "c1", "base_url": "https://api.example.com",
+      "model": "vendor/m1", "token": "tok-1"},
+     {"name": "c2", "base_url": "", "model": "", "token": ""}])) == {"c1": "tok-1"}
+_cu_presets = [
+    {"name": "c1", "base_url": "https://api.example.com",
+     "model": "vendor/m1", "token": "tok-1"},
+    {"name": "c2", "base_url": "", "model": "vendor/m2", "token": "tok-2"}]
+assert app.custom_dispatch_inputs(None, _cu_presets) == {}
+assert app.custom_dispatch_inputs("asis", _cu_presets) == {}
+assert app.custom_dispatch_inputs(("custom", "c1", "vendor/m1"),
+                                  _cu_presets) == {
+    "custom_preset": "c1",
+    "custom_base_url": "https://api.example.com/v1",
+    "custom_model": "vendor/m1"}
+assert app.custom_dispatch_inputs(("custom", "c1", "vendor/other"),
+                                  _cu_presets)["custom_model"] == "vendor/other"
+assert app.custom_dispatch_inputs(("custom", "nope", "vendor/m1"),
+                                  _cu_presets) == {}
+assert app.custom_dispatch_inputs(("custom", "c2", "vendor/m2"),
+                                  _cu_presets) == {}  # no base URL
+assert app.custom_dispatch_inputs(("custom", "c1", ""),
+                                  _cu_presets) == {}  # no model
+assert app.custom_dispatch_inputs(("custom", "c1"), _cu_presets) == {}
+assert app.custom_dispatch_inputs(("openrouter", "m"), _cu_presets) == {}
+print("custom normalize/lookup/inputs OK")
+
+# reorder helper mirrors the account ones (whole-entry swap, ends no-op)
+_cu_re = [{"name": "c1", "base_url": "https://a.example.com",
+           "model": "m1", "token": "t1"},
+          {"name": "c2", "base_url": "https://b.example.com",
+           "model": "m2", "token": "t2"},
+          {"name": "c3", "base_url": "https://c.example.com",
+           "model": "m3", "token": "t3"}]
+assert app.move_custom_preset(_cu_re, 1, -1) == 0
+assert [a["name"] for a in _cu_re] == ["c2", "c1", "c3"]
+assert [a["token"] for a in _cu_re] == ["t2", "t1", "t3"]
+assert [a["base_url"] for a in _cu_re] == [
+    "https://b.example.com", "https://a.example.com",
+    "https://c.example.com"]
+assert app.move_custom_preset(_cu_re, 0, -1) == 0  # top: no-op
+assert app.move_custom_preset(_cu_re, 2, 1) == 2  # bottom: no-op
+assert app.move_custom_preset(_cu_re, 0, 1) == 1
+assert app.custom_preset_by_name(_cu_re, "c1")["token"] == "t1"
+assert app.custom_preset_by_name(_cu_re, "nope") is None
+print("custom preset reorder OK")
+
+# dispatch routing: a ("custom", preset, model) choice must reach the
+# Custom inputs (never the OpenRouter path — a 3-tuple would crash
+# its 2-value unpack), and an unknown preset dispatches nothing.
+_app = app.App.__new__(app.App)
+_app.settings = {"custom_presets": _cu_presets,
+                 "openrouter_accounts": [], "nvidia_accounts": []}
+_app.instances = {("t", "syd1"): {"file": "syd1.yml"}}
+_app.runs = {}
+_app.log = logs.append
+
+
+class _CapGH:
+    seen = "NOT-CALLED"
+
+    def __init__(self, pat):
+        pass
+
+    def dispatch(self, repo, branch, wf, inputs=None):
+        _CapGH.seen = inputs
+        return True
+
+
+_orig_GH = app.GH
+app.GH = _CapGH
+try:
+    _app._dispatch(CFG, "syd1", ("custom", "c1", "vendor/m1"))
+    assert _CapGH.seen == {"custom_preset": "c1",
+                           "custom_base_url": "https://api.example.com/v1",
+                           "custom_model": "vendor/m1"}, _CapGH.seen
+    _CapGH.seen = "NOT-CALLED"
+    _app._dispatch(CFG, "syd1", ("custom", "nope", "vendor/m1"))
+    assert _CapGH.seen == "NOT-CALLED", _CapGH.seen
+    assert any("no Custom preset configured" in l for l in logs), logs
+    _CapGH.seen = "NOT-CALLED"
+    _app._dispatch(CFG, "syd1", ("custom", "c1", ""))
+    assert _CapGH.seen == "NOT-CALLED", _CapGH.seen
+    # the old providers still route: NVIDIA per-machine, OpenRouter as-is
+    _app.settings["nvidia_accounts"] = [
+        {"name": "n1", "token": "t1"}, {"name": "n2", "token": "t2"}]
+    _app._dispatch(CFG, "syd1", ("nvidia", "some-model"))
+    assert _CapGH.seen == {"nvidia_account": "n1",
+                           "nvidia_model": "some-model"}, _CapGH.seen
+    _app._dispatch(CFG, "syd1", None)
+    assert _CapGH.seen == {}, _CapGH.seen
+finally:
+    app.GH = _orig_GH
+print("custom dispatch routing (3-tuple + no-preset skip) OK")
+
+# template: custom inputs, step 12d fail-fast lookup, §4 provider block,
+# §4c seat override; OpenRouter + NVIDIA + plain paths intact
+assert "custom_preset:" in _t and "custom_base_url:" in _t
+assert "custom_model:" in _t
+assert "12d. Resolve Custom preset for this run only" in _t
+assert "CUSTOM_KEYS" in _t and "CUSTOM_API_KEY" in _t
+assert 'if: inputs.custom_preset != ' in _t
+assert 'os.environ.get("CUSTOM_MODEL"' in _t
+assert 'os.environ.get("CUSTOM_BASE_URL"' in _t
+assert "{env:CUSTOM_API_KEY}" in _t
+assert 'setdefault("custom", {})' in _t
+assert '"custom/" + _cu_id' in _t
+print("custom template (inputs + 12d + §4 provider block + §4c override) OK")
 
 print("openrouter template (inputs + 12b + §4/§4c override) OK")
 

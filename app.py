@@ -202,6 +202,21 @@ on:
         required: false
         default: ""
         type: string
+      custom_preset:
+        description: "Custom preset name (must exist in the CUSTOM_KEYS secret JSON; empty = current Zen setup)"
+        required: false
+        default: ""
+        type: string
+      custom_base_url:
+        description: "Custom preset base URL, e.g. https://api.example.com (empty = current Zen setup)"
+        required: false
+        default: ""
+        type: string
+      custom_model:
+        description: "Custom preset model id, e.g. vendor/model (empty = current Zen setup)"
+        required: false
+        default: ""
+        type: string
 
 
 jobs:
@@ -584,6 +599,63 @@ jobs:
           print(f"NVIDIA account '{account}' resolved for this run only")
           PYEOF_NV
 
+      # 12d. Per-run Custom preset choice (Remote-Op dispatch inputs only).
+      #     Runs ONLY when a dispatch carried a preset name; a plain
+      #     dispatch (or any other trigger) skips it and the run keeps
+      #     the current Zen setup. Same shape as steps 12b/12c: the
+      #     token is NEVER sent in the dispatch — it is read here from
+      #     the CUSTOM_KEYS secret (one JSON object, preset name ->
+      #     token, set by the repo owner), masked, and exported via
+      #     $GITHUB_ENV so step 13 and the `opencode serve` process
+      #     inherit CUSTOM_API_KEY from the environment. §4 writes the
+      #     `custom` provider block (OpenAI-compatible, the preset's
+      #     baseURL) into opencode.json for this run only, reading the
+      #     key from that variable — no key is written into the
+      #     config. Missing secret / bad JSON / unknown preset /
+      #     missing base URL / missing model all fail fast, with the
+      #     preset name only in the message — never the token or the
+      #     JSON.
+      - name: 12d. Resolve Custom preset for this run only
+        if: inputs.custom_preset != ''
+        env:
+          CUSTOM_KEYS: ${{ secrets.CUSTOM_KEYS }}
+          CUSTOM_PRESET: ${{ inputs.custom_preset }}
+          CUSTOM_BASE_URL: ${{ inputs.custom_base_url }}
+          CUSTOM_MODEL: ${{ inputs.custom_model }}
+        run: |
+          python3 - <<'PYEOF_CU'
+          import json, os, sys
+          keys_raw = os.environ.get("CUSTOM_KEYS", "")
+          if not keys_raw:
+              print("::error::CUSTOM_KEYS secret is not set on this repo — "
+                    "set it (JSON: preset name -> token) or dispatch without a Custom preset")
+              sys.exit(1)
+          try:
+              keys = json.loads(keys_raw)
+          except Exception:
+              print("::error::CUSTOM_KEYS is not valid JSON")
+              sys.exit(1)
+          preset = os.environ.get("CUSTOM_PRESET", "")
+          base_url = os.environ.get("CUSTOM_BASE_URL", "")
+          model = os.environ.get("CUSTOM_MODEL", "")
+          if not base_url:
+              print("::error::custom_base_url is empty — dispatch with a preset, its base URL and a model")
+              sys.exit(1)
+          if not model:
+              print("::error::custom_model is empty — dispatch with both a preset and a model")
+              sys.exit(1)
+          token = keys.get(preset) if isinstance(keys, dict) else None
+          if not isinstance(token, str) or not token:
+              print(f"::error::Custom preset '{preset}' not found in CUSTOM_KEYS")
+              sys.exit(1)
+          print("::add-mask::" + token)
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("CUSTOM_API_KEY=" + token + "\n")
+              f.write("CUSTOM_BASE_URL=" + base_url + "\n")
+              f.write("CUSTOM_MODEL=" + model + "\n")
+          print(f"Custom preset '{preset}' resolved for this run only")
+          PYEOF_CU
+
       - name: 13. Install OpenCode V2, restore state, configure MCPs + Superpowers plugin & start serve
         env:
           OPENCODE_SERVER_PASSWORD: ${{ secrets.RUNNER_PASSWORD }}
@@ -727,8 +799,9 @@ jobs:
           # only for an NVIDIA run; a plain dispatch leaves whatever
           # provider block the restored config already had untouched
           # (and the model resolution below restores the Zen model).
-          # When BOTH overrides are somehow set, NVIDIA wins — the
-          # Run dialog only ever sends one provider's inputs.
+          # When several overrides are somehow set, Custom wins,
+          # then NVIDIA — the Run dialog only ever sends one
+          # provider's inputs.
           # The NIM id itself usually contains a slash (e.g.
           # nvidia/nemotron-3-ultra-550b-a55b), so the OpenCode ref
           # is nvidia/<NIM id> — three segments. A value already in
@@ -738,6 +811,33 @@ jobs:
           if _nv_id.startswith("nvidia/nvidia/"):
               _nv_id = _nv_id[len("nvidia/"):]
           _nv_model = ("nvidia/" + _nv_id) if _nv_id else ""
+          # Per-run Custom preset override (step 12d exported
+          # CUSTOM_MODEL + CUSTOM_BASE_URL only when the dispatch
+          # carried a preset name). Like NVIDIA it needs an explicit
+          # provider block: an OpenAI-compatible provider pointing
+          # at the preset's baseURL, reading its key from
+          # CUSTOM_API_KEY in the environment (step 12d), with the
+          # chosen model registered in its `models` map. The
+          # OpenCode ref is custom/<model-id>; a value already in
+          # that form has its one leading custom/ stripped back to
+          # the id. The baseURL is normalized here too (a manual
+          # dispatch may send it raw): trailing slashes stripped,
+          # a trailing /v1/models trimmed to /v1, /v1 appended
+          # unless already there. The block is written only for a
+          # Custom run; a plain dispatch leaves whatever provider
+          # block the restored config already had untouched (and
+          # the model resolution below restores the Zen model).
+          _cu_raw = os.environ.get("CUSTOM_MODEL", "").strip()
+          _cu_base = os.environ.get("CUSTOM_BASE_URL", "").strip()
+          _cu_id = _cu_raw[len("custom/"):] \
+              if _cu_raw.startswith("custom/") else _cu_raw
+          _cu_model = ("custom/" + _cu_id) if _cu_id else ""
+          if _cu_base:
+              _cu_base = _cu_base.rstrip("/")
+              if _cu_base.endswith("/v1/models"):
+                  _cu_base = _cu_base[:-len("/models")]
+              if not _cu_base.endswith("/v1"):
+                  _cu_base = _cu_base + "/v1"
           # The default model is PER-INSTANCE and comes from the
           # opencode/default-models.txt file in this repo: one full
           # model id per line (# comments and blank lines ignored).
@@ -777,7 +877,18 @@ jobs:
               else:
                   break
           _idx = int(_num) - 1 if _num else 0
-          if _nv_model:
+          if _cu_model and _cu_base:
+              _prov = cfg.setdefault("provider", {})
+              _custom = _prov.setdefault("custom", {})
+              _custom["npm"] = "@ai-sdk/openai-compatible"
+              _custom["name"] = "Custom"
+              _custom_opts = _custom.setdefault("options", {})
+              _custom_opts["baseURL"] = _cu_base
+              _custom_opts["apiKey"] = "{env:CUSTOM_API_KEY}"
+              _custom.setdefault("models", {}).setdefault(
+                  _cu_id, {"name": _cu_id})
+              cfg["model"] = _cu_model
+          elif _nv_model:
               _nim_id = _nv_id
               _prov = cfg.setdefault("provider", {})
               _nvidia = _prov.setdefault("nvidia", {})
@@ -932,17 +1043,23 @@ jobs:
                                 ("nemotron", "opencode/nemotron-3.5-lightning-free"),
                                 ("glm", "opencode/glm-5.3-flash-free")):
               councillors.setdefault(cname, {})["model"] = cmodel
-          # Per-run provider override (same NVIDIA_MODEL /
-          # OPENROUTER_MODEL as §4, NVIDIA checked first): EVERY slim
-          # seat — agents, council and councillors — on the chosen
-          # model for this run only, and the preset forced to "free"
-          # so these seats are the ones actually used. The runner's
-          # slim config is never committed back, so the next plain
-          # dispatch restores the free-preset seats above.
+          # Per-run provider override (same CUSTOM_MODEL /
+          # NVIDIA_MODEL / OPENROUTER_MODEL as §4, Custom checked
+          # first, then NVIDIA): EVERY slim seat — agents, council
+          # and councillors — on the chosen model for this run
+          # only, and the preset forced to "free" so these seats
+          # are the ones actually used. The runner's slim config
+          # is never committed back, so the next plain dispatch
+          # restores the free-preset seats above.
+          _cu_raw = os.environ.get("CUSTOM_MODEL", "").strip()
           _nv_raw = os.environ.get("NVIDIA_MODEL", "").strip()
           _or_raw = os.environ.get("OPENROUTER_MODEL", "").strip()
           _override = ""
-          if _nv_raw:
+          if _cu_raw:
+              _cu_id = _cu_raw[len("custom/"):] \
+                  if _cu_raw.startswith("custom/") else _cu_raw
+              _override = "custom/" + _cu_id
+          elif _nv_raw:
               _nv_id = _nv_raw[len("nvidia/"):] \
                   if _nv_raw.startswith("nvidia/nvidia/") else _nv_raw
               _override = "nvidia/" + _nv_id
@@ -1451,6 +1568,205 @@ def nvidia_dispatch_inputs_for_machine(choice, wf, accounts):
     return nvidia_dispatch_inputs(choice)
 
 
+# Custom presets (per-run provider choice at Run time)
+# ---------------------------------------------------------------------------
+# Named presets for free tokens from various providers: each preset
+# carries its own base URL + default model id + token. At Run time
+# ONE preset is picked for the whole Run action (every machine uses
+# it) and the model may still be changed there — the preset's model
+# is only the default. Same delivery as OpenRouter/NVIDIA: the token
+# is NEVER sent in the dispatch — the runner reads it from the one
+# JSON CUSTOM_KEYS secret per fleet repo (preset name -> token) in
+# step 12d — and §4 writes a `custom` provider block
+# (OpenAI-compatible, the preset's baseURL) for that run only.
+# Only OpenAI-compatible endpoints are supported in v1. The model
+# list is fetched live from the preset's own base URL with its own
+# token (to that base URL only, never logged); a fetch failure
+# falls back to manual entry.
+
+CUSTOM_KEYS_SECRET = "CUSTOM_KEYS"
+
+
+def blank_custom_preset():
+    return {"name": "", "base_url": "", "model": "", "token": ""}
+
+
+def normalize_custom_presets(presets):
+    """Settings-shape Custom presets: drop entries with no name,
+    trim name/base_url/model/token, keep the FIRST entry per name.
+    Tokens are never logged or echoed anywhere in this app."""
+    seen, out = set(), []
+    for a in presets or []:
+        if not isinstance(a, dict):
+            continue
+        name = str(a.get("name", "")).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append({"name": name,
+                    "base_url": str(a.get("base_url", "")).strip(),
+                    "model": str(a.get("model", "")).strip(),
+                    "token": str(a.get("token", "")).strip()})
+    return out
+
+
+def custom_preset_names(presets):
+    return [a["name"] for a in normalize_custom_presets(presets)]
+
+
+def custom_preset_by_name(presets, name):
+    """One preset by name, or None. Only the entry is returned —
+    callers never log its token."""
+    wanted = (name or "").strip()
+    for a in normalize_custom_presets(presets):
+        if a["name"] == wanted:
+            return a
+    return None
+
+
+def custom_models_url(base_url):
+    """<base>/v1/models for a preset's base URL: trailing slashes
+    stripped; a URL already ending in /v1/models is kept, one
+    ending in /v1 gains /models, anything else gains /v1/models.
+    "" for a blank base URL (the caller then never fetches)."""
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        return ""
+    if base.endswith("/v1/models"):
+        return base
+    if base.endswith("/v1"):
+        return base + "/models"
+    return base + "/v1/models"
+
+
+def custom_provider_base_url(base_url):
+    """Provider baseURL for a preset's base URL: trailing slashes
+    stripped; a trailing /v1/models is trimmed to /v1; /v1 is
+    appended unless already there. "" for a blank base URL. This
+    mirrors the normalization §4 applies on the runner."""
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        return ""
+    if base.endswith("/v1/models"):
+        base = base[:-len("/models")]
+    if not base.endswith("/v1"):
+        base += "/v1"
+    return base
+
+
+def custom_model_ids(payload):
+    """Model ids from a /v1/models payload (OpenAI-compatible list
+    shape: {"data": [{"id": ...}]}). Sorted, de-duplicated.
+    Entries without a string id are skipped; a missing/non-list
+    `data` yields []. No free filter is applied: the preset's
+    provider does not mark free endpoints."""
+    ids = set()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    for entry in data or []:
+        if not isinstance(entry, dict):
+            continue
+        mid = entry.get("id")
+        if isinstance(mid, str) and mid:
+            ids.add(mid)
+    return sorted(ids, key=str.casefold)
+
+
+def fetch_custom_models(base_url, token, urlopen=None, timeout=10):
+    """Model ids, live from a preset's own base URL, authenticated
+    with that preset's token. [] on ANY failure (no/blank base URL
+    or token, network, timeout, bad payload) — and with a blank
+    base URL or token the opener is never called. The Run dialog
+    then offers manual model entry instead of blocking. The token
+    is sent only to the preset's base URL, in the Authorization
+    header, and is never logged."""
+    if not isinstance(token, str) or not token.strip():
+        return []
+    url = custom_models_url(base_url)
+    if not url:
+        return []
+    opener = urlopen or urllib.request.urlopen
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Remote-Op",
+                     "Authorization": "Bearer " + token.strip()})
+        with opener(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        return custom_model_ids(payload)
+    except Exception:
+        return []
+
+
+def normalize_custom_model(raw):
+    """OpenCode model REF for a chosen Custom model id: "custom/" +
+    the id as listed (e.g. vendor/model -> custom/vendor/model).
+    A value already in that form is returned unchanged; anything
+    else is taken as the model id as-is. "" stays "" (no choice)."""
+    mid = (raw or "").strip()
+    if not mid:
+        return ""
+    if mid.startswith("custom/"):
+        return mid
+    return "custom/" + mid
+
+
+def custom_token_from_keys(keys_json, preset):
+    """Mirror of the runner-side lookup in step 12d: the token for
+    `preset` in a CUSTOM_KEYS JSON object, else None. Malformed
+    JSON, a non-object, or a non-string/empty token all yield None."""
+    try:
+        keys = json.loads(keys_json or "")
+    except Exception:
+        return None
+    if not isinstance(keys, dict):
+        return None
+    token = keys.get(preset)
+    return token if isinstance(token, str) and token else None
+
+
+def custom_keys_json(presets):
+    """The CUSTOM_KEYS secret content for the configured presets:
+    {name: token}. Only presets with both a name and a token are
+    included; callers copy this to paste into GitHub."""
+    return json.dumps(
+        {a["name"]: a["token"]
+         for a in normalize_custom_presets(presets)
+         if a["token"]},
+        indent=2, ensure_ascii=False)
+
+
+def custom_dispatch_inputs(choice, presets):
+    """workflow_dispatch inputs for a Custom Run choice: None /
+    "asis" -> {}; ("custom", preset, model) -> the preset NAME, its
+    (normalized) base URL and the model. The token is NEVER an
+    input. {} when the preset is unknown in settings, its base URL
+    is empty, or the model is empty — the caller must NOT dispatch
+    plain in that case (a silent Zen fallback would hide the
+    misconfiguration)."""
+    if not choice or choice == "asis":
+        return {}
+    if isinstance(choice, tuple) and len(choice) == 3 \
+            and choice[0] == "custom":
+        _tag, preset, model = choice
+        entry = custom_preset_by_name(presets, preset)
+        if entry is None:
+            return {}
+        base_url = custom_provider_base_url(entry.get("base_url", ""))
+        if not base_url or not (model or "").strip():
+            return {}
+        return {"custom_preset": preset,
+                "custom_base_url": base_url,
+                "custom_model": (model or "").strip()}
+    return {}
+
+
+def move_custom_preset(presets, idx, delta):
+    """Same list-order move as move_openrouter_account, for the
+    Custom presets: list order is the order presets are offered
+    in the Run dialog (the first is the default pick)."""
+    return _move_account_entry(presets, idx, delta)
+
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
@@ -1504,6 +1820,9 @@ def load_settings(path=None):
             if isinstance(data, dict) else [],
             "nvidia_accounts": normalize_nvidia_accounts(
                 data.get("nvidia_accounts"))
+            if isinstance(data, dict) else [],
+            "custom_presets": normalize_custom_presets(
+                data.get("custom_presets"))
             if isinstance(data, dict) else []}
 
 
@@ -2310,6 +2629,7 @@ class App:
         ttk.Button(top, text="Repos…", command=self._repos_dialog).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="OpenRouter accounts…", command=self._openrouter_dialog).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="NVIDIA accounts…", command=self._nvidia_dialog).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="Custom presets…", command=self._custom_dialog).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="↻ Refresh", command=self.refresh).pack(side=tk.LEFT, padx=2)
         self.status_var = tk.StringVar(value="")
         tk.Label(top, textvariable=self.status_var, bg=BG,
@@ -2877,28 +3197,42 @@ class App:
             return
         or_accounts = self.settings.get("openrouter_accounts", [])
         nv_accounts = self.settings.get("nvidia_accounts", [])
+        cu_presets = normalize_custom_presets(
+            self.settings.get("custom_presets", []))
+        is_custom = isinstance(choice, tuple) and bool(choice) \
+            and choice[0] == "custom"
         is_nvidia = isinstance(choice, tuple) and bool(choice) \
             and choice[0] == "nvidia"
-        if is_nvidia:
+        if is_custom:
+            inputs = custom_dispatch_inputs(choice, cu_presets)
+        elif is_nvidia:
             inputs = nvidia_dispatch_inputs_for_machine(
                 choice, wf, nv_accounts)
         else:
             inputs = openrouter_dispatch_inputs_for_machine(
                 choice, wf, or_accounts)
         if isinstance(choice, tuple) and choice and not inputs:
-            provider = "NVIDIA" if is_nvidia else "OpenRouter"
-            self.log(f"{cfg['label']}/{wf}: no {provider} account "
-                     f"configured — add accounts in '{provider} "
-                     f"accounts…' or run as-is; NOT dispatched")
+            if is_custom:
+                self.log(f"{cfg['label']}/{wf}: no Custom preset "
+                         f"configured — add presets in 'Custom "
+                         f"presets…' or run as-is; NOT dispatched")
+            else:
+                provider = "NVIDIA" if is_nvidia else "OpenRouter"
+                self.log(f"{cfg['label']}/{wf}: no {provider} account "
+                         f"configured — add accounts in '{provider} "
+                         f"accounts…' or run as-is; NOT dispatched")
             return
         if GH(cfg["pat"]).dispatch(cfg["repo"], cfg["branch"], info["file"], inputs):
             if inputs:
                 account = inputs.get("nvidia_account") \
-                    or inputs.get("openrouter_account")
+                    or inputs.get("openrouter_account") \
+                    or inputs.get("custom_preset")
                 model = inputs.get("nvidia_model") \
-                    or inputs.get("openrouter_model")
-                provider = "NVIDIA" if "nvidia_account" in inputs \
-                    else "OpenRouter"
+                    or inputs.get("openrouter_model") \
+                    or inputs.get("custom_model")
+                provider = "Custom" if "custom_preset" in inputs \
+                    else ("NVIDIA" if "nvidia_account" in inputs
+                          else "OpenRouter")
                 self.log(f"{cfg['label']}/{wf}: dispatched "
                          f"({provider}: {account} / {model})")
             else:
@@ -3511,27 +3845,35 @@ class App:
         each machine uses the account matching its instance number
         (machine 1 -> 1st account in that provider's settings order,
         machine 2 -> 2nd, wrapping), and the preview shows the
-        mapping for the selected provider.
+        mapping for the selected provider. Custom is the exception:
+        ONE preset is picked here for the whole run (every machine
+        uses it) and its model is only the default — it may still
+        be changed in this dialog.
 
         Returns None (cancel — nothing is dispatched), "asis"
         (OpenCode/Zen: the current per-instance setup, no inputs),
-        ("openrouter", model), or ("nvidia", model) — the provider
-        and the model slug for this run only. Tokens are never part
-        of the return value: the runner reads them from the
-        provider's KEYS secret. Each provider's model list loads in
-        the background (NVIDIA's with the first NVIDIA account's
-        token, to NVIDIA's API only); if a list fails, manual entry
+        ("openrouter", model), ("nvidia", model), or ("custom",
+        preset, model) — the provider and the model slug for this
+        run only. Tokens are never part of the return value: the
+        runner reads them from the provider's KEYS secret. Each
+        provider's model list loads in the background (NVIDIA's
+        with the first NVIDIA account's token, to NVIDIA's API
+        only; Custom's with the selected preset's token, to that
+        preset's base URL only); if a list fails, manual entry
         still works and the dialog never blocks the run."""
         or_accounts = normalize_openrouter_accounts(
             self.settings.get("openrouter_accounts", []))
         nv_accounts = normalize_nvidia_accounts(
             self.settings.get("nvidia_accounts", []))
+        cu_presets = normalize_custom_presets(
+            self.settings.get("custom_presets", []))
         or_names = [a["name"] for a in or_accounts]
         nv_names = [a["name"] for a in nv_accounts]
+        cu_names = [a["name"] for a in cu_presets]
         result = {"value": None}
         win = tk.Toplevel(self.root)
         win.title("Run machines")
-        win.geometry("560x540")
+        win.geometry("560x580")
         win.transient(self.root)
 
         tk.Label(win, text="Provider (this run only):",
@@ -3542,14 +3884,27 @@ class App:
         for _value, _label in (
                 ("opencode", "OpenCode (Zen — current setup)"),
                 ("openrouter", "OpenRouter"),
-                ("nvidia", "NVIDIA")):
+                ("nvidia", "NVIDIA"),
+                ("custom", "Custom…")):
             ttk.Radiobutton(radios, text=_label, variable=provider_var,
                             value=_value).pack(side=tk.LEFT, padx=4)
 
-        tk.Label(win, text="Account per machine (automatic — not picked "
-                          "here): machine 1 → 1st account, machine 2 → "
-                          "2nd, and so on (wraps). Reorder accounts in "
-                          "the provider's accounts dialog (top bar).",
+        preset_row = tk.Frame(win)
+        preset_row.pack(fill=tk.X, padx=10, pady=(6, 0))
+        tk.Label(preset_row, text="Custom preset:",
+                 anchor="w").pack(side=tk.LEFT)
+        preset_var = tk.StringVar(
+            value=cu_names[0] if cu_names else "")
+        preset_combo = ttk.Combobox(preset_row, textvariable=preset_var,
+                                    values=cu_names, state="readonly",
+                                    width=40)
+        preset_combo.pack(side=tk.LEFT, padx=4)
+
+        tk.Label(win, text="OpenRouter / NVIDIA: the account per machine "
+                          "is automatic (machine 1 → 1st account, "
+                          "machine 2 → 2nd, and so on, wrapping). "
+                          "Custom: one preset for the whole run, "
+                          "picked above.",
                  fg="#666", wraplength=520, justify="left",
                  anchor="w").pack(fill=tk.X, padx=10, pady=(6, 2))
         preview_var = tk.StringVar()
@@ -3562,6 +3917,21 @@ class App:
                 preview_var.set("Zen: each machine keeps its per-instance "
                                 "model (default-models.txt / variable / "
                                 "built-in list). No inputs are sent.")
+                return
+            if provider == "custom":
+                if not cu_names:
+                    preview_var.set("No Custom presets yet — add them in "
+                                    "'Custom presets…' (top bar), or pick "
+                                    "OpenCode above.")
+                    return
+                preset = custom_preset_by_name(
+                    cu_presets, preset_var.get()) or cu_presets[0]
+                preview_var.set(
+                    f"Custom: {preset['name']} "
+                    f"({preset['base_url'] or 'no base URL yet'}) — "
+                    "every machine in this run uses this preset; the "
+                    "model defaults to the preset's model "
+                    f"({preset['model'] or 'none set'}).")
                 return
             accounts = or_accounts if provider == "openrouter" \
                 else nv_accounts
@@ -3600,12 +3970,18 @@ class App:
                  anchor="w").pack(fill=tk.X, padx=10)
         # Per-provider lists: None = not loaded yet. NVIDIA's list is
         # fetched with the first NVIDIA account's token (to NVIDIA's
-        # API only, never logged); OpenRouter's needs no key.
-        state = {"openrouter": None, "nvidia": None, "loading": set()}
+        # API only, never logged); a Custom list is fetched with the
+        # selected preset's token (to that preset's base URL only,
+        # never logged); OpenRouter's needs no key.
+        state = {"openrouter": None, "nvidia": None, "custom": {},
+                 "loading": set()}
 
         def refill():
             provider = provider_var.get()
-            models = state.get(provider) or []
+            if provider == "custom":
+                models = state["custom"].get(preset_var.get()) or []
+            else:
+                models = state.get(provider) or []
             q = search_var.get().strip().casefold()
             lb.delete(0, tk.END)
             for mid in models:
@@ -3615,8 +3991,44 @@ class App:
 
         search_var.trace_add("write", lambda *_a: refill())
 
-        def load_models(provider):
-            if provider == "opencode" or provider in state["loading"]:
+        def load_models(provider, preset=None):
+            if provider == "opencode":
+                return
+            if provider == "custom":
+                if preset is None:
+                    preset = preset_var.get()
+                key = "custom:" + preset
+                if key in state["loading"]:
+                    return
+                if state["custom"].get(preset) is not None:
+                    return
+                state["loading"].add(key)
+                entry = custom_preset_by_name(cu_presets, preset)
+
+                def work():
+                    models = fetch_custom_models(
+                        entry["base_url"] if entry else "",
+                        entry["token"] if entry else "")
+
+                    def done():
+                        state["loading"].discard(key)
+                        if not win.winfo_exists():
+                            return
+                        state["custom"][preset] = models
+                        if provider_var.get() == "custom" \
+                                and preset_var.get() == preset:
+                            if models:
+                                status_var.set(f"{len(models)} models")
+                            else:
+                                status_var.set("Could not load the model "
+                                               "list — type a model ID "
+                                               "instead.")
+                            refill()
+                    self.root.after(0, done)
+
+                threading.Thread(target=work, daemon=True).start()
+                return
+            if provider in state["loading"]:
                 return
             if state.get(provider) is not None:
                 return
@@ -3649,11 +4061,36 @@ class App:
         def on_provider_change(*_a):
             provider = provider_var.get()
             update_preview()
+            preset_combo.configure(
+                state="readonly" if provider == "custom" else "disabled")
             if provider == "opencode":
                 list_label_var.set(
                     "Model: none to pick for OpenCode (Zen).")
                 status_var.set("Run uses each machine's Zen model.")
                 lb.delete(0, tk.END)
+            elif provider == "custom":
+                list_label_var.set(
+                    "Custom model (live list from the preset's base "
+                    "URL, or type an id below):")
+                if not cu_names:
+                    status_var.set("No Custom presets — add one first, "
+                                   "or pick OpenCode.")
+                    lb.delete(0, tk.END)
+                else:
+                    preset = preset_var.get() or cu_names[0]
+                    preset_var.set(preset)
+                    loaded = state["custom"].get(preset)
+                    entry = custom_preset_by_name(cu_presets, preset)
+                    default = entry["model"] if entry else ""
+                    if loaded is None:
+                        status_var.set(
+                            f"Loading models from {preset}…")
+                    else:
+                        status_var.set(
+                            f"{len(loaded)} models "
+                            f"(default: {default or 'none set'})")
+                    refill()
+                    load_models("custom", preset)
             elif provider == "openrouter":
                 list_label_var.set(
                     "Free model (live list, or type an id below):")
@@ -3677,6 +4114,24 @@ class App:
                     refill()
                     load_models("nvidia")
 
+        def on_preset_change(_evt=None):
+            update_preview()
+            if provider_var.get() != "custom":
+                return
+            preset = preset_var.get()
+            entry = custom_preset_by_name(cu_presets, preset)
+            loaded = state["custom"].get(preset)
+            if loaded is None:
+                status_var.set(f"Loading models from {preset}…")
+            else:
+                status_var.set(
+                    f"{len(loaded)} models "
+                    f"(default: {entry['model'] if entry else 'none set'})")
+            refill()
+            load_models("custom", preset)
+
+        preset_combo.bind("<<ComboboxSelected>>", on_preset_change)
+
         provider_var.trace_add("write", on_provider_change)
 
         tk.Label(win, text="Or type a model ID (wins over the list):",
@@ -3692,6 +4147,27 @@ class App:
             provider = provider_var.get()
             if provider == "opencode":
                 finish("asis")
+                return
+            if provider == "custom":
+                if not cu_names:
+                    status_var.set("No Custom presets — add them in "
+                                   "'Custom presets…' first, "
+                                   "or pick OpenCode.")
+                    return
+                preset = preset_var.get() or cu_names[0]
+                model = manual_var.get().strip()
+                if not model:
+                    sel = lb.curselection()
+                    if sel:
+                        model = lb.get(sel[0])
+                if not model:
+                    entry = custom_preset_by_name(cu_presets, preset)
+                    model = entry["model"] if entry else ""
+                if not model:
+                    status_var.set("Pick a model, type a model ID, "
+                                   "or pick OpenCode.")
+                    return
+                finish(("custom", preset, model))
                 return
             names = or_names if provider == "openrouter" else nv_names
             if not names:
@@ -4169,6 +4645,182 @@ class App:
             load_fields(0)
         else:
             new_account()
+
+    # -- custom presets dialog --------------------------------------------------------
+    def _custom_dialog(self):
+        """Manage the Custom presets stored in settings.json (name +
+        base URL + default model + token). Each preset is one free
+        provider endpoint (OpenAI-compatible only, v1): at Run time
+        ONE preset is picked for the whole Run action and every
+        machine uses it, with the preset's model as the default —
+        the model may still be changed in the Run dialog. List
+        order is the order presets are offered in the Run dialog
+        (the first is the default pick). The token is NEVER sent by
+        this app at dispatch and never logged: the runner reads it
+        from the CUSTOM_KEYS GitHub Secret, and Remote-Op sends
+        only the preset name + base URL + model. 'Copy JSON' builds
+        that secret's content from these presets for pasting into
+        GitHub — set the secret yourself, in each fleet repo. A
+        preset's token is also used, from this machine only, to
+        fetch the live model list from that preset's base URL in
+        the Run dialog."""
+        presets = self.settings.setdefault("custom_presets", [])
+        self.settings["custom_presets"] = normalize_custom_presets(presets)
+        presets = self.settings["custom_presets"]
+        win = tk.Toplevel(self.root)
+        win.title("Custom presets")
+        win.geometry("720x400")
+        lb = tk.Listbox(win, width=24)
+        lb.pack(side=tk.LEFT, fill=tk.Y, padx=6, pady=6)
+        for a in presets:
+            lb.insert(tk.END, a["name"])
+
+        form = tk.Frame(win)
+        form.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=6, pady=6)
+        vars_ = {}
+        rows = [("name", "Name", 30, False),
+                ("base_url", "Base URL", 46, False),
+                ("model", "Default model", 46, False),
+                ("token", "Token", 46, True)]
+        for key, title, w, secret in rows:
+            r = tk.Frame(form)
+            r.pack(fill=tk.X, pady=2)
+            tk.Label(r, text=title, width=12, anchor="w").pack(side=tk.LEFT)
+            v = tk.StringVar()
+            tk.Entry(r, textvariable=v, width=w,
+                     show="•" if secret else "").pack(side=tk.LEFT)
+            vars_[key] = v
+        tk.Label(form, text="One preset per provider endpoint "
+                            "(OpenAI-compatible only): the base URL is "
+                            "the provider's API root, with or without "
+                            "a trailing /v1 — e.g. "
+                            "https://api.example.com. Tokens live in "
+                            "settings.json next to the exe (like PATs — "
+                            "keep the file private) and are never sent "
+                            "at dispatch. The runner reads the token "
+                            "from the CUSTOM_KEYS GitHub Secret (JSON: "
+                            "preset name -> token), which you set "
+                            "yourself in each fleet repo. 'Copy JSON' "
+                            "builds that secret's content from the "
+                            "presets here. At Run time one preset is "
+                            "picked for the whole run; its model is "
+                            "only the default and may be changed "
+                            "there. The preset's token is also used "
+                            "to fetch the live model list from its "
+                            "base URL (to that URL only, never "
+                            "logged).",
+                 fg="#666", wraplength=430,
+                 justify="left").pack(anchor="w", pady=4)
+        state = {"idx": None}
+
+        def load_fields(idx):
+            state["idx"] = idx
+            a = presets[idx] if idx is not None else blank_custom_preset()
+            for k, v in vars_.items():
+                v.set(a.get(k, ""))
+
+        def flush():
+            if state["idx"] is None:
+                return
+            a = presets[state["idx"]]
+            for k, v in vars_.items():
+                a[k] = v.get().strip()
+
+        def on_select(_evt=None):
+            flush()
+            sel = lb.curselection()
+            if sel:
+                load_fields(sel[0])
+
+        lb.bind("<<ListboxSelect>>", on_select)
+
+        btns = tk.Frame(form)
+        btns.pack(fill=tk.X, pady=8)
+
+        def new_preset():
+            flush()
+            presets.append(blank_custom_preset())
+            lb.insert(tk.END, "")
+            lb.selection_clear(0, tk.END)
+            lb.selection_set(tk.END)
+            load_fields(len(presets) - 1)
+
+        def del_preset():
+            sel = lb.curselection()
+            if not sel:
+                return
+            del presets[sel[0]]
+            lb.delete(sel[0])
+            state["idx"] = None
+            load_fields(None)
+
+        def move_preset(delta):
+            sel = lb.curselection()
+            if not sel:
+                return
+            flush()
+            new_idx = move_custom_preset(presets, sel[0], delta)
+            if new_idx == sel[0]:
+                return
+            lb.delete(0, tk.END)
+            for a in presets:
+                lb.insert(tk.END, a["name"])
+            lb.selection_clear(0, tk.END)
+            lb.selection_set(new_idx)
+            load_fields(new_idx)
+
+        def copy_json():
+            flush()
+            text = custom_keys_json(presets)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.log("CUSTOM_KEYS JSON copied — paste it as the "
+                     "CUSTOM_KEYS secret in each fleet repo "
+                     "(token values are never logged).")
+
+        def save_close():
+            if state["idx"] is None and any(
+                    v.get().strip() for v in vars_.values()):
+                presets.append(blank_custom_preset())
+                lb.insert(tk.END, "")
+                state["idx"] = len(presets) - 1
+            flush()
+            kept = [a for a in presets if a.get("name")]
+            names = [a["name"] for a in kept]
+            if len(names) != len(set(names)):
+                messagebox.showerror(
+                    "Remote-Op",
+                    "Preset names must be unique — rename the duplicate "
+                    "before saving.")
+                return
+            self.settings["custom_presets"] = normalize_custom_presets(kept)
+            try:
+                save_settings(self.settings)
+            except OSError as e:
+                messagebox.showerror(
+                    "Remote-Op",
+                    f"Could not save settings:\n{SETTINGS_PATH}\n\n{e}")
+                return
+            self.log(f"Custom presets saved "
+                     f"({len(self.settings['custom_presets'])} preset(s); "
+                     f"tokens are never logged).")
+            win.destroy()
+
+        tk.Button(btns, text="New", command=new_preset).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Delete", command=del_preset).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Move up",
+                  command=lambda: move_preset(-1)).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Move down",
+                  command=lambda: move_preset(1)).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Copy JSON for GitHub Secret",
+                  command=copy_json).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Save & close",
+                  command=save_close).pack(side=tk.LEFT, padx=10)
+        if presets:
+            lb.selection_set(0)
+            load_fields(0)
+        else:
+            new_preset()
 
     def _persist_password_setx(self):
         """Persist the TARGET repo's server password for future
