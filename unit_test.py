@@ -516,23 +516,26 @@ plan = app.plan_update(gh, CFG, log, only_wfs={"rey2"})
 assert plan["changed"] == [] and plan["unchanged"] == ["rey2"]
 print("update workflows (checked/all, one commit, idempotent) OK")
 
-# backup-taking cancelled: only the sync-back step is gone.
-# Restores (step 12 9router db, step 13 OpenCode state) are untouched,
-# 9router settings are untouched, and there is NO OPENCODE_API_KEY
-# anywhere in the template.
+# backup-taking cancelled: only the opencode sync-back step is gone.
+# Step 12 fetches the 9router db from the private keys repo instead of
+# restoring a per-instance file, and step 16b backs it up there on
+# shutdown — so 9router keys/combos survive, while the fleet repo still
+# never holds a db file. There is NO OPENCODE_API_KEY anywhere in the
+# template.
 _t = app.embedded_template("syd1", "haileen5/my-opencode")
 assert _t.startswith("# Managed by Remote-Op")
 assert "Sync opencode state" not in _t
 assert "OPENCODE_API_KEY" not in _t
 assert "Console smoke check" not in _t
 assert "Dropped stale 9router baseURL" not in _t
-assert "12. Restore 9router db backup" in _t
+assert "12. Fetch 9router db from keys repo" in _t
 assert "Restore the OpenCode backup" in _t
 assert "9router.sqlite" in _t
 assert "13. Install OpenCode V2, restore state" in _t
 assert "16. Tailscale Logout" in _t and "17. Tailscale" not in _t
+assert "16b. Back up 9router db to keys repo" in _t
 assert "git push origin" in _t  # fork-beta sync in step 7 stays
-print("backup-cancelled template (restore + 9router untouched) OK")
+print("backup-cancelled template (keys-repo fetch + 16b backup) OK")
 
 # --- OpenRouter per-run choice ------------------------------------------------
 # settings: accounts migrate, round-trip, dedupe/drop malformed
@@ -659,8 +662,8 @@ assert 'os.environ.get("OPENROUTER_MODEL"' in _t
 assert 'cfg["preset"] = "free"' in _t
 # the override is per-run only: plain dispatch keeps the file/variable/built-in path
 assert "default-models.txt" in _t and "OPENCODE_DEFAULT_MODELS" in _t
-# 9router untouched by the OpenRouter change
-assert "12. Restore 9router db backup" in _t and "9router.sqlite" in _t
+# 9router fetch step intact alongside the OpenRouter change
+assert "12. Fetch 9router db from keys repo" in _t and "9router.sqlite" in _t
 # per-machine account mapping: machine N -> accounts[N-1], wrapping
 _accts = [{"name": "a1", "token": "t1"}, {"name": "a2", "token": "t2"},
           {"name": "a3", "token": "t3"}]
@@ -841,7 +844,8 @@ assert app.nvidia_account_for_instance("syd2", _nv_re) == "n2"
 print("nvidia account reorder OK")
 
 # template: nvidia inputs, step 12c fail-fast lookup, §4 provider block,
-# §4c seat override; OpenRouter + plain paths intact, 9router untouched
+# §4c seat override; OpenRouter + plain paths intact (plain dispatch is
+# now the 9router provider — see the 9router block below)
 assert "nvidia_account:" in _t and "nvidia_model:" in _t
 assert "12c. Resolve NVIDIA account for this run only" in _t
 assert "NVIDIA_KEYS" in _t and "NVIDIA_API_KEY" in _t
@@ -1080,5 +1084,28 @@ assert '"custom/" + _cu_id' in _t
 print("custom template (inputs + 12d + §4 provider block + §4c override) OK")
 
 print("openrouter template (inputs + 12b + §4/§4c override) OK")
+
+# --- 9router keys repo ----------------------------------------------------------
+# step 12 fetches the shared db from the account's private keys repo
+# (<owner>/my-9router), §4 serves it as the plain-dispatch provider
+# (9router/code), §4c puts every slim seat on it, and step 16b backs
+# it up there on shutdown. Per-run Custom/NVIDIA/OpenRouter still win;
+# a missing key falls back to the Zen models.
+_nr = app.embedded_template("syd1", "haileen5/my-opencode")
+assert "12. Fetch 9router db from keys repo" in _nr
+assert "haileen5/my-9router" in _nr and "Shabakebehdasht/my-9router" not in _nr
+assert "NINE_ROUTER_API_KEY" in _nr and "HERMES_CUSTOM_API_KEY" in _nr
+assert "::error::could not clone" in _nr  # fail-fast fetch
+assert "9router/code" in _nr and "http://127.0.0.1:20128/v1" in _nr
+assert '{env:NINE_ROUTER_API_KEY}' in _nr
+assert '_override = "9router/code"' in _nr
+assert "opencode/deepseek-v4.1-flash-free" in _nr  # Zen fallback intact
+assert "16b. Back up 9router db to keys repo" in _nr
+assert _nr.count("\n        if: always()\n") == 2  # steps 16 + 16b (comment mentions excluded)
+assert "opencode/instances/${WF_NAME}/9router.sqlite" not in _nr
+# the keys repo follows the fleet repo's owner, per account
+_nr2 = app.embedded_template("rey1", "Shabakebehdasht/my-opencode")
+assert "Shabakebehdasht/my-9router" in _nr2 and "haileen5/my-9router" not in _nr2
+print("9router keys-repo template (fetch + §4/§4c + 16b, per-owner) OK")
 
 print("ALL OK")

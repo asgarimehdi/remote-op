@@ -227,6 +227,7 @@ jobs:
       REPO_ORIGIN: https://github.com/{{OWNER}}/h-dashboard.git
       WF_NAME: {{WF_NAME}}
       OPENCODE_MODELS: ${{ vars.OPENCODE_DEFAULT_MODELS }}
+      NINE_ROUTER_API_KEY: ${{ secrets.HERMES_CUSTOM_API_KEY }}
 
     steps:
       - name: 1. Checkout Repository
@@ -475,22 +476,34 @@ jobs:
             echo '⚠️ 9router binary not found after installation'
           fi
 
-      - name: 12. Restore 9router db backup & start hidden (tray)
+      - name: 12. Fetch 9router db from keys repo & start hidden (tray)
+        env:
+          GH_TOKEN: ${{ secrets.MY_PAT }}
         run: |
           export INITIAL_PASSWORD="${{ secrets.RUNNER_PASSWORD }}"
           # Make sure the data dir exists
           mkdir -p ~/.9router/db
-          BACKUP_DIR="${GITHUB_WORKSPACE:-.}/opencode/instances/${WF_NAME}"
-          # Restore THIS instance's backed-up 9router state. State is
-          # per-instance under opencode/instances/<wf>/ (data,
-          # cbm-cache, 9router db) so the four workflows never
-          # overwrite each other; only opencode/config stays shared.
-          if [ -f "$BACKUP_DIR/9router.sqlite" ]; then
-            cp "$BACKUP_DIR/9router.sqlite" ~/.9router/db/data.sqlite
-            echo '✅ Restored 9router data.sqlite from repo backup'
-          else
-            echo '⚠️ per-instance 9router.sqlite not found in repo — starting fresh'
+          # The 9router db lives in the private keys repo
+          # ({{OWNER}}/my-9router, file 9router.sqlite at root) — one
+          # shared db for this account. It is fetched fresh on every
+          # boot; nothing is read from opencode/instances/<wf>/ any
+          # more, and the db is never written back (keys must not
+          # land in this public fleet repo's history). Fail fast if
+          # the keys repo or the file is unreachable — a silent
+          # fresh start would boot a keyless router.
+          KEYS_TMP="$(mktemp -d)"
+          if ! git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/{{OWNER}}/my-9router.git" "$KEYS_TMP"; then
+            echo '::error::could not clone {{OWNER}}/my-9router — check the repo exists and MY_PAT can read it'
+            exit 1
           fi
+          if [ -f "$KEYS_TMP/9router.sqlite" ]; then
+            cp "$KEYS_TMP/9router.sqlite" ~/.9router/db/data.sqlite
+            echo '✅ Restored 9router data.sqlite from keys repo'
+          else
+            echo '::error::9router.sqlite not found in {{OWNER}}/my-9router'
+            exit 1
+          fi
+          rm -rf "$KEYS_TMP"
           # Start 9router hidden in the background (tray mode) on the default port 20128.
           # --tray is the same "hide to background" option used interactively.
           nohup 9router --tray --skip-update -p 20128 > /tmp/9router.log 2>&1 &
@@ -838,6 +851,18 @@ jobs:
                   _cu_base = _cu_base[:-len("/models")]
               if not _cu_base.endswith("/v1"):
                   _cu_base = _cu_base + "/v1"
+          # 9router provider: this machine's own 9router on
+          # http://127.0.0.1:20128 (step 12 restores its db from the
+          # private keys repo {{OWNER}}/my-9router). OpenCode talks
+          # to it as an OpenAI-compatible provider; the model is the
+          # `code` combo, addressed by name — 9router routes it
+          # across the combo's models. The key comes from the
+          # HERMES_CUSTOM_API_KEY repo secret (job env
+          # NINE_ROUTER_API_KEY); its value must match an apiKey in
+          # the restored db or 9router answers 401. A plain dispatch
+          # uses 9router/code; a per-run provider choice above still
+          # wins for that run only.
+          _nr_key = os.environ.get("NINE_ROUTER_API_KEY", "").strip()
           # The default model is PER-INSTANCE and comes from the
           # opencode/default-models.txt file in this repo: one full
           # model id per line (# comments and blank lines ignored).
@@ -902,6 +927,16 @@ jobs:
               cfg["model"] = _nv_model
           elif _or_model:
               cfg["model"] = _or_model
+          elif _nr_key:
+              _prov = cfg.setdefault("provider", {})
+              _nr = _prov.setdefault("9router", {})
+              _nr["npm"] = "@ai-sdk/openai-compatible"
+              _nr["name"] = "9router"
+              _nr_opts = _nr.setdefault("options", {})
+              _nr_opts["baseURL"] = "http://127.0.0.1:20128/v1"
+              _nr_opts["apiKey"] = "{env:NINE_ROUTER_API_KEY}"
+              _nr.setdefault("models", {}).setdefault("code", {"name": "code"})
+              cfg["model"] = "9router/code"
           else:
               cfg["model"] = _models[_idx % len(_models)]
           mcp = cfg.get("mcp", {})
@@ -1043,14 +1078,17 @@ jobs:
                                 ("nemotron", "opencode/nemotron-3.5-lightning-free"),
                                 ("glm", "opencode/glm-5.3-flash-free")):
               councillors.setdefault(cname, {})["model"] = cmodel
-          # Per-run provider override (same CUSTOM_MODEL /
-          # NVIDIA_MODEL / OPENROUTER_MODEL as §4, Custom checked
-          # first, then NVIDIA): EVERY slim seat — agents, council
-          # and councillors — on the chosen model for this run
-          # only, and the preset forced to "free" so these seats
-          # are the ones actually used. The runner's slim config
-          # is never committed back, so the next plain dispatch
-          # restores the free-preset seats above.
+          # Provider override (same CUSTOM_MODEL / NVIDIA_MODEL /
+          # OPENROUTER_MODEL as §4, Custom checked first, then
+          # NVIDIA): EVERY slim seat — agents, council and
+          # councillors — on the chosen model for this run only,
+          # and the preset forced to "free" so these seats are the
+          # ones actually used. The runner's slim config is never
+          # committed back, so the next plain dispatch restores the
+          # seats below. A plain dispatch (no per-run choice) puts
+          # every seat on the local 9router combo, the same
+          # 9router/code as §4's main model — NINE_ROUTER_API_KEY
+          # set means the key is present.
           _cu_raw = os.environ.get("CUSTOM_MODEL", "").strip()
           _nv_raw = os.environ.get("NVIDIA_MODEL", "").strip()
           _or_raw = os.environ.get("OPENROUTER_MODEL", "").strip()
@@ -1065,6 +1103,8 @@ jobs:
               _override = "nvidia/" + _nv_id
           elif _or_raw:
               _override = "openrouter/" + _or_raw if not _or_raw.startswith("openrouter/") else _or_raw
+          elif os.environ.get("NINE_ROUTER_API_KEY", "").strip():
+              _override = "9router/code"
           if _override:
               for _seat in list(free_preset.values()):
                   if isinstance(_seat, dict):
@@ -1077,7 +1117,10 @@ jobs:
           cfg.setdefault("preset", "free")
           with open(path, "w") as f:
               json.dump(cfg, f, indent=2)
-          print("✅ oh-my-opencode-slim.json ready: 'free' preset — every agent on a free OpenCode Zen model")
+          if _override:
+              print(f"✅ oh-my-opencode-slim.json ready: 'free' preset — every agent on {_override}")
+          else:
+              print("✅ oh-my-opencode-slim.json ready: 'free' preset — every agent on a free OpenCode Zen model")
           PYEOF3
 
           # 5. Start opencode serve in the background on 0.0.0.0:4096 so it
@@ -1105,6 +1148,77 @@ jobs:
             sleep 60
             echo "[$i/340] Server is active (SSH + Laravel :8000 + OpenCode :4096)..."
           done
+
+      - name: 16b. Back up 9router db to keys repo (on shutdown)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.MY_PAT }}
+        run: |
+          # Back up the live 9router db into the private keys repo
+          # ({{OWNER}}/my-9router, file 9router.sqlite) so keys/combos
+          # added or changed during this run survive shutdown. Runs
+          # on every shutdown (cancel/timeout included) via
+          # if: always(). 9router is stopped first so SQLite
+          # checkpoints its WAL into data.sqlite; the copy is
+          # integrity-checked before it is pushed, and a failed
+          # backup is a loud warning, not a failed run. If ara1 and
+          # ara2 shut down together they race on the same file —
+          # last writer wins; both booted from the same file, so
+          # only usage-history rows can differ. If step 12 never
+          # restored a db (fetch failed), no file exists here and
+          # nothing is backed up — an empty db can never overwrite
+          # the keys repo.
+          pkill -f "9router --tray --skip-update" || true
+          for _i in $(seq 1 10); do pgrep -f "9router --tray" >/dev/null || break; sleep 1; done
+          DB_SRC="$HOME/.9router/db/data.sqlite"
+          if [ ! -f "$DB_SRC" ]; then
+            echo '::warning::no 9router db found — nothing to back up'
+            exit 0
+          fi
+          # Merge any WAL content still on disk (no-op if 9router
+          # already flushed it on exit) and copy to a temp file.
+          if command -v sqlite3 >/dev/null 2>&1; then
+            sqlite3 "$DB_SRC" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
+          fi
+          TMP_DIR="$(mktemp -d)"
+          TMP_DB="$TMP_DIR/9router.sqlite"
+          cp "$DB_SRC" "$TMP_DB" || { echo '::warning::could not copy the 9router db — backup skipped'; exit 0; }
+          if command -v sqlite3 >/dev/null 2>&1; then
+            if ! sqlite3 "$TMP_DB" "PRAGMA integrity_check;" 2>/dev/null | grep -qx "ok"; then
+              echo '::warning::backed-up 9router db failed integrity_check — NOT pushed'
+              exit 0
+            fi
+          fi
+          # Push with a bounded retry: a second machine shutting down
+          # at the same time can win the race on the same file.
+          for attempt in 1 2 3; do
+            KEYS_TMP="$(mktemp -d)"
+            if git clone --depth 1 --branch main "https://x-access-token:${GH_TOKEN}@github.com/{{OWNER}}/my-9router.git" "$KEYS_TMP"; then
+              cp "$TMP_DB" "$KEYS_TMP/9router.sqlite" || continue
+              cd "$KEYS_TMP" || continue
+              git add 9router.sqlite || continue
+              if git diff --cached --quiet; then
+                echo '✅ 9router db unchanged — nothing to back up'
+                exit 0
+              fi
+              if git -c user.name="{{OWNER}}" -c user.email="{{OWNER}}@users.noreply.github.com" commit -m "Backup 9router db from ${WF_NAME} (run ${GITHUB_RUN_ID})"; then
+                if git push origin main; then
+                  echo "✅ 9router db backed up to {{OWNER}}/my-9router (attempt $attempt)"
+                  exit 0
+                fi
+                echo "⚠️ push failed (attempt $attempt) — retrying"
+              else
+                echo "⚠️ commit failed (attempt $attempt) — retrying"
+              fi
+              cd "$GITHUB_WORKSPACE" || true
+            else
+              echo "⚠️ clone failed (attempt $attempt) — retrying"
+            fi
+            rm -rf "$KEYS_TMP"
+            sleep 10
+          done
+          echo '::warning::9router db backup failed after 3 attempts — the live db died with this runner'
+          exit 0
 
       - name: 16. Tailscale Logout (cleanup on shutdown)
         if: always()
