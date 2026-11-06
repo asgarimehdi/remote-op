@@ -3987,12 +3987,19 @@ class App:
         result = {"value": None}
         win = tk.Toplevel(self.root)
         win.title("Run machines")
-        win.geometry("560x580")
+        win.geometry("560x640")
         win.transient(self.root)
+        # The Run/Cancel bar is packed first, anchored at the bottom,
+        # so it can never be pushed off-screen when the dialog is
+        # shorter than its content — the model list shrinks instead.
+        btns = tk.Frame(win)
+        btns.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=10)
 
         tk.Label(win, text="Provider (this run only):",
                  anchor="w").pack(fill=tk.X, padx=10, pady=(10, 2))
-        provider_var = tk.StringVar(value="openrouter")
+        # Zen (OpenCode) is the default: a plain Run uses each
+        # machine's per-instance Zen model with no inputs sent.
+        provider_var = tk.StringVar(value="opencode")
         radios = tk.Frame(win)
         radios.pack(fill=tk.X, padx=10)
         for _value, _label in (
@@ -4301,8 +4308,6 @@ class App:
                 model = lb.get(sel[0])
             finish((provider, model))
 
-        btns = tk.Frame(win)
-        btns.pack(fill=tk.X, padx=10, pady=10)
         ttk.Button(btns, text="▶ Run",
                    style="Accent.TButton",
                    command=run_provider).pack(side=tk.LEFT, padx=2)
