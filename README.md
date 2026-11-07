@@ -153,6 +153,10 @@ and the same light theme.
   statuses every cycle (30s while anything is starting, else
   5 minutes), so a stopped machine flips to ● DOWN by itself
   instead of sitting on ◐ STARTING until the next manual Refresh.
+- **Dark theme** — a "Dark theme" checkbox next to Hide down
+  switches the whole app (main window and open dialogs) between
+  the dark palette (the default) and the original light one, live
+  and without a restart; the choice is saved in `settings.json`.
 
 New instances start with a clean state and create
 `opencode/instances/<name>/` on their first sync.

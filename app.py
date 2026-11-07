@@ -2174,6 +2174,9 @@ def load_settings(path=None):
             "active": data.get("active", "") if isinstance(data, dict) else "",
             "hide_down": bool(data.get("hide_down"))
             if isinstance(data, dict) else False,
+            "theme": (data.get("theme") if isinstance(data, dict)
+                      and data.get("theme") in ("dark", "light")
+                      else "dark"),
             "openrouter_accounts": normalize_openrouter_accounts(
                 data.get("openrouter_accounts"))
             if isinstance(data, dict) else [],
@@ -2878,6 +2881,74 @@ def update_repo_workflows(gh, cfg, log, only_wfs=None):
 
 
 # ---------------------------------------------------------------------------
+# Themes: two palettes on ttk's clam base. "light" is the original look;
+# "dark" is the default (light strains the eyes). Every color the UI
+# uses comes from here, so the toggle can re-theme the whole app live:
+# _configure_styles/_configure_tags re-read the palette, and
+# _apply_theme walks the widget tree mapping old colors onto new ones.
+# ---------------------------------------------------------------------------
+
+THEMES = {
+    "light": {
+        "bg": "#f3f4f6", "panel": "#ffffff", "ink": "#111827",
+        "muted": "#6b7280", "accent": "#2563eb",
+        "accent_active": "#1d4ed8", "accent_disabled": "#93c5fd",
+        "accent_disabled_fg": "#ffffff",
+        "button": "#e8ebef", "button_active": "#d9dee6",
+        "button_disabled": "#eef0f3", "border": "#d1d5db",
+        "card_border": "#e5e7eb", "heading": "#eef2f7",
+        "selected": "#dbeafe", "selected_fg": "#111827",
+        "tag_low": "#c0392b", "tag_ok": "#1e8449",
+        "tag_starting": "#d97706", "tag_down": "#c0392b",
+        "acct": "#e8eef5", "even": "#ffffff", "odd": "#f8fafc",
+        "log_err": "#b91c1c", "log_ok": "#15803d", "log_warn": "#b45309",
+        "op_running_fg": "#92400e", "op_running_bg": "#fef3c7",
+        "op_ok_fg": "#166534", "op_ok_bg": "#dcfce7",
+        "op_fail_fg": "#991b1b", "op_fail_bg": "#fee2e2",
+        "check_fill": "#ffffff", "check_border": "#666666",
+        "check_tick": "#1a7f37", "danger": "#b91c1c",
+    },
+    "dark": {
+        "bg": "#1f2937", "panel": "#111827", "ink": "#e5e7eb",
+        "muted": "#9ca3af", "accent": "#3b82f6",
+        "accent_active": "#2563eb", "accent_disabled": "#1e3a5f",
+        "accent_disabled_fg": "#9ca3af",
+        "button": "#374151", "button_active": "#4b5563",
+        "button_disabled": "#2b3442", "border": "#4b5563",
+        "card_border": "#374151", "heading": "#273244",
+        "selected": "#1d4ed8", "selected_fg": "#ffffff",
+        "tag_low": "#f87171", "tag_ok": "#4ade80",
+        "tag_starting": "#fbbf24", "tag_down": "#f87171",
+        "acct": "#1e293b", "even": "#111827", "odd": "#1a2233",
+        "log_err": "#f87171", "log_ok": "#4ade80", "log_warn": "#fbbf24",
+        "op_running_fg": "#fbbf24", "op_running_bg": "#3a2f10",
+        "op_ok_fg": "#4ade80", "op_ok_bg": "#12351f",
+        "op_fail_fg": "#f87171", "op_fail_bg": "#3f1518",
+        "check_fill": "#111827", "check_border": "#9ca3af",
+        "check_tick": "#4ade80", "danger": "#f87171",
+    },
+}
+
+
+def _norm_hex(c):
+    """Normalize a Tk color for comparison: lowercase, #rgb -> #rrggbb,
+    and the two default names Tk hands back for unset colors.
+    Anything else (another name, an empty value) comes back unchanged."""
+    if not isinstance(c, str):
+        return c
+    if c == "white":
+        return "#ffffff"
+    if c == "black":
+        return "#000000"
+    if not c.startswith("#"):
+        return c
+    c = c.lower()
+    if len(c) == 4:
+        return "#" + "".join(ch * 2 for ch in c[1:])
+    return c
+
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
@@ -2898,41 +2969,22 @@ class App:
         self._op_desc = None
 
         # ---- theme ---------------------------------------------------
-        # Same light theme as RemoteHermes, on ttk's clam base (pure
-        # stdlib): soft gray app background, white cards, one accent
-        # for primary actions, Segoe UI text, Consolas for the log.
-        BG, PANEL = "#f3f4f6", "#ffffff"
-        INK, MUTED, ACCENT = "#111827", "#6b7280", "#2563eb"
+        # Two palettes (THEMES) on ttk's clam base (pure stdlib):
+        # light is the original look, dark is the default. The toggle
+        # in the util bar re-applies the palette live via
+        # _apply_theme; dialogs read self.BG / self.MUTED when they
+        # are built, so they follow the current theme too.
+        self._theme = self.settings.get("theme") or "dark"
+        self._pal = THEMES.get(self._theme) or THEMES["dark"]
+        pal = self._pal
+        BG, PANEL = pal["bg"], pal["panel"]
+        INK, MUTED, ACCENT = pal["ink"], pal["muted"], pal["accent"]
         self.BG, self.MUTED = BG, MUTED
         root.configure(bg=BG)
         root.option_add("*Font", ("Segoe UI", 10))
         root.minsize(1080, 620)
-        style = ttk.Style(root)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-        style.configure(".", font=("Segoe UI", 10), background=BG,
-                        foreground=INK)
-        style.configure("TButton", padding=(10, 5), background="#e8ebef",
-                        bordercolor="#d1d5db")
-        style.map("TButton",
-                  background=[("active", "#d9dee6"),
-                              ("disabled", "#eef0f3")])
-        style.configure("Accent.TButton", background=ACCENT,
-                        foreground="#ffffff", bordercolor=ACCENT)
-        style.map("Accent.TButton",
-                  background=[("active", "#1d4ed8"),
-                              ("disabled", "#93c5fd")],
-                  foreground=[("disabled", "#ffffff")])
-        style.configure("Danger.TButton", foreground="#b91c1c")
-        style.configure("Treeview", background=PANEL,
-                        fieldbackground=PANEL, rowheight=26, borderwidth=0)
-        style.configure("Treeview.Heading", background="#eef2f7",
-                        font=("Segoe UI", 10, "bold"), relief="flat")
-        style.map("Treeview", background=[("selected", "#dbeafe")],
-                  foreground=[("selected", INK)])
-        style.configure("TCombobox", padding=4)
+        self._set_option_defaults()
+        self._configure_styles()
 
         def section(parent, text):
             tk.Label(parent, text=text, bg=BG, fg=MUTED,
@@ -2960,7 +3012,7 @@ class App:
         # Two panes below the header: fleet list + controls on the
         # LEFT (full height), log on the RIGHT. Draggable divider.
         body = tk.PanedWindow(root, orient=tk.HORIZONTAL, sashwidth=4,
-                              bg="#d1d5db", bd=0)
+                              bg=pal["border"], bd=0)
         body.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         left = tk.Frame(body, bg=BG)
         right = tk.Frame(body, bg=BG)
@@ -2977,7 +3029,7 @@ class App:
         ttk.Button(bar, text="▶▶ Run all", command=self.run_all).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="⏹ Stop all", command=self.cancel_all).pack(side=tk.LEFT, padx=2)
 
-        tree_card = tk.Frame(left, bg=PANEL, highlightbackground="#e5e7eb",
+        tree_card = tk.Frame(left, bg=PANEL, highlightbackground=pal["card_border"],
                              highlightthickness=1)
         tree_card.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
         # One tree for the whole fleet: a group row per repo (its
@@ -2993,14 +3045,6 @@ class App:
                               ("server", "Server", 105)]:
             self.tree.heading(col, text=title)
             self.tree.column(col, width=w)
-        self.tree.tag_configure("low", foreground="#c0392b")
-        self.tree.tag_configure("ok", foreground="#1e8449")
-        self.tree.tag_configure("starting", foreground="#d97706")
-        self.tree.tag_configure("down", foreground="#c0392b")
-        self.tree.tag_configure("acct", background="#e8eef5",
-                                font=("Segoe UI", 10, "bold"))
-        self.tree.tag_configure("even", background="#ffffff")
-        self.tree.tag_configure("odd", background="#f8fafc")
         vsb = ttk.Scrollbar(tree_card, orient=tk.VERTICAL,
                             command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
@@ -3044,6 +3088,11 @@ class App:
         ttk.Checkbutton(util, text="Hide down",
                         variable=self.hide_down_var,
                         command=self._toggle_hide_down).pack(side=tk.LEFT, padx=6)
+        self.dark_var = tk.BooleanVar(
+            value=self.settings.get("theme") == "dark")
+        ttk.Checkbutton(util, text="Dark theme",
+                        variable=self.dark_var,
+                        command=self._toggle_theme).pack(side=tk.LEFT, padx=6)
         self.uptime_var = tk.StringVar(value="server check: —")
         tk.Label(util, textvariable=self.uptime_var, bg=BG,
                  fg=MUTED).pack(side=tk.LEFT, padx=6)
@@ -3051,17 +3100,15 @@ class App:
         section(right, "LOG")
         self.op_var = tk.StringVar(value="")
         self.op_label = tk.Label(right, textvariable=self.op_var, anchor="w",
-                                 bg="#eef2f7", fg=INK,
+                                 bg=pal["heading"], fg=INK,
                                  font=("Segoe UI", 10, "bold"))
         self.op_label.pack(fill=tk.X, padx=12, pady=(0, 6), ipady=5)
         self.logbox = scrolledtext.ScrolledText(
             right, height=14, state="normal", bg=PANEL,
             font=("Consolas", 9), relief="flat", wrap=tk.WORD,
-            highlightbackground="#e5e7eb", highlightthickness=1)
+            highlightbackground=pal["card_border"], highlightthickness=1)
         self.logbox.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 10))
-        self.logbox.tag_configure("err", foreground="#b91c1c")
-        self.logbox.tag_configure("ok", foreground="#15803d")
-        self.logbox.tag_configure("warn", foreground="#b45309")
+        self._configure_tags()
         self._sync_repo_combo()
         self._apply_active_password()
         if self.settings["repos"]:
@@ -3121,7 +3168,8 @@ class App:
         scroll past. The mutating buttons lock while an op runs."""
         def ui():
             self.op_var.set(f"⏳ {what} — running…")
-            self.op_label.config(fg="#92400e", bg="#fef3c7")
+            self.op_label.config(fg=self._pal["op_running_fg"],
+                                 bg=self._pal["op_running_bg"])
             for b in (self.btn_add, self.btn_bulk, self.btn_del,
                       self.btn_rename, self.btn_upd, self.btn_upd_all):
                 b.state(["disabled"])
@@ -3130,8 +3178,9 @@ class App:
     def _op_done(self, text, ok=True):
         def ui():
             self.op_var.set(("✅ " if ok else "⚠️ ") + text)
-            self.op_label.config(fg="#166534" if ok else "#991b1b",
-                                 bg="#dcfce7" if ok else "#fee2e2")
+            self.op_label.config(
+                fg=self._pal["op_ok_fg"] if ok else self._pal["op_fail_fg"],
+                bg=self._pal["op_ok_bg"] if ok else self._pal["op_fail_bg"])
             for b in (self.btn_add, self.btn_bulk, self.btn_del,
                       self.btn_rename, self.btn_upd, self.btn_upd_all):
                 b.state(["!disabled"])
@@ -3273,22 +3322,210 @@ class App:
             self.log(f"could not save settings: {e}")
         self._fill_tree()
 
-    @staticmethod
-    def _box_image(kind):
-        """A tiny checkbox image: 0 = empty, 1 = ticked, 2 = partial."""
+    # -- theme ----------------------------------------------------------
+    def _set_option_defaults(self):
+        """Option-database defaults for the current palette: widgets
+        that never set a color (plain labels, dialog entries, the log
+        box) inherit these at creation time instead of Tk's black
+        text on white — which is invisible on a dark theme. Explicit
+        widget options still win. Re-run on every theme switch so
+        dialogs built later follow the new palette."""
+        pal = self._pal
+        self.root.option_add("*foreground", pal["ink"])
+        self.root.option_add("*background", pal["bg"])
+        self.root.option_add("*Entry.background", pal["panel"])
+        self.root.option_add("*Text.background", pal["panel"])
+        self.root.option_add("*selectBackground", pal["selected"])
+        self.root.option_add("*selectForeground", pal["selected_fg"])
+        self.root.option_add("*insertBackground", pal["ink"])
+
+    def _configure_styles(self):
+        """ttk styles for the current palette. Styles are global, so
+        one call re-themes every ttk widget — including open dialogs.
+        theme_use("clam") first resets the base, giving a clean slate
+        on every re-apply."""
+        pal = self._pal
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure(".", font=("Segoe UI", 10), background=pal["bg"],
+                        foreground=pal["ink"])
+        style.configure("TButton", padding=(10, 5), background=pal["button"],
+                        bordercolor=pal["border"])
+        style.map("TButton",
+                  background=[("active", pal["button_active"]),
+                              ("disabled", pal["button_disabled"])])
+        style.configure("Accent.TButton", background=pal["accent"],
+                        foreground="#ffffff", bordercolor=pal["accent"])
+        style.map("Accent.TButton",
+                  background=[("active", pal["accent_active"]),
+                              ("disabled", pal["accent_disabled"])],
+                  foreground=[("disabled", pal["accent_disabled_fg"])])
+        style.configure("Danger.TButton", foreground=pal["danger"])
+        style.configure("Treeview", background=pal["panel"],
+                        fieldbackground=pal["panel"], foreground=pal["ink"],
+                        rowheight=26, borderwidth=0)
+        style.configure("Treeview.Heading", background=pal["heading"],
+                        foreground=pal["ink"],
+                        font=("Segoe UI", 10, "bold"), relief="flat")
+        style.map("Treeview", background=[("selected", pal["selected"])],
+                  foreground=[("selected", pal["selected_fg"])])
+        style.configure("TCombobox", padding=4, fieldbackground=pal["panel"],
+                        foreground=pal["ink"], background=pal["button"])
+        style.configure("TEntry", fieldbackground=pal["panel"],
+                        foreground=pal["ink"])
+        # A readonly combobox ignores fieldbackground on its own — the
+        # field only goes dark with the readonly state maps (verified
+        # against clam: fieldbackground alone leaves it light).
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", pal["panel"])],
+                  background=[("readonly", pal["button"])],
+                  foreground=[("readonly", pal["ink"])])
+        style.configure("Vertical.TScrollbar", background=pal["button"],
+                        troughcolor=pal["bg"], bordercolor=pal["border"],
+                        arrowcolor=pal["ink"])
+        style.configure("Horizontal.TScrollbar", background=pal["button"],
+                        troughcolor=pal["bg"], bordercolor=pal["border"],
+                        arrowcolor=pal["ink"])
+        # The combobox popdown is a Listbox created on demand; these
+        # options are read when it opens.
+        self.root.option_add("*TCombobox*Listbox.background", pal["panel"])
+        self.root.option_add("*TCombobox*Listbox.foreground", pal["ink"])
+        self.root.option_add("*TCombobox*Listbox.selectBackground",
+                             pal["selected"])
+        self.root.option_add("*TCombobox*Listbox.selectForeground",
+                             pal["selected_fg"])
+
+    def _configure_tags(self):
+        """Tree + log tag colors for the current palette."""
+        pal = self._pal
+        self.tree.tag_configure("low", foreground=pal["tag_low"])
+        self.tree.tag_configure("ok", foreground=pal["tag_ok"])
+        self.tree.tag_configure("starting", foreground=pal["tag_starting"])
+        self.tree.tag_configure("down", foreground=pal["tag_down"])
+        self.tree.tag_configure("acct", background=pal["acct"],
+                                font=("Segoe UI", 10, "bold"))
+        self.tree.tag_configure("even", background=pal["even"])
+        self.tree.tag_configure("odd", background=pal["odd"])
+        self.logbox.tag_configure("err", foreground=pal["log_err"])
+        self.logbox.tag_configure("ok", foreground=pal["log_ok"])
+        self.logbox.tag_configure("warn", foreground=pal["log_warn"])
+
+    def _toggle_theme(self):
+        name = "dark" if self.dark_var.get() else "light"
+        self.settings["theme"] = name
+        try:
+            save_settings(self.settings)
+        except OSError as e:
+            self.log(f"could not save settings: {e}")
+        self._apply_theme(name)
+
+    def _apply_theme(self, name):
+        """Apply a theme live: styles, tags, every tk widget's colors
+        (walked from the old palette onto the new one), checkbox
+        images and the tree refill — without rebuilding the window or
+        losing checked rows, selection or scroll position. Dialogs
+        built later read self.BG / self.MUTED and follow along."""
+        new = THEMES.get(name) or THEMES["dark"]
+        old = self._pal
+        if new is old:
+            return
+        bg_map = {}
+        for key in ("bg", "panel", "heading", "border", "card_border",
+                    "op_running_bg", "op_ok_bg", "op_fail_bg"):
+            bg_map[_norm_hex(old[key])] = new[key]
+        fg_map = {}
+        for key in ("ink", "muted", "op_running_fg", "op_ok_fg",
+                    "op_fail_fg"):
+            fg_map[_norm_hex(old[key])] = new[key]
+        fg_map["#666666"] = new["muted"]  # dialogs' fg="#666"
+        # Widgets that never set a foreground (labels, the log box,
+        # dialog entries) report Tk's default black — on a dark theme
+        # that is invisible, so it maps to ink like the rest.
+        fg_map["#000000"] = new["ink"]
+        self._theme, self._pal = name, new
+        self.settings["theme"] = name
+        self.BG, self.MUTED = new["bg"], new["muted"]
+        self._set_option_defaults()
+        self._configure_styles()
+        self._configure_tags()
+
+        def visit(w):
+            try:
+                opts = w.configure()
+            except tk.TclError:
+                return
+            for opt, mapping in (("background", bg_map),
+                                 ("activebackground", bg_map),
+                                 ("highlightbackground", bg_map),
+                                 ("selectbackground", bg_map),
+                                 ("foreground", fg_map),
+                                 ("activeforeground", fg_map),
+                                 ("selectforeground", fg_map)):
+                if opt in opts:
+                    try:
+                        cur = _norm_hex(w.cget(opt))
+                    except tk.TclError:
+                        continue
+                    if cur in mapping:
+                        try:
+                            w.configure(**{opt: mapping[cur]})
+                        except tk.TclError:
+                            pass
+            if isinstance(w, tk.Text):
+                try:
+                    w.configure(insertbackground=new["ink"],
+                                selectbackground=new["selected"],
+                                selectforeground=new["selected_fg"])
+                except tk.TclError:
+                    pass
+            elif isinstance(w, tk.Scrollbar):
+                try:
+                    w.configure(background=new["button"],
+                                activebackground=new["button_active"],
+                                troughcolor=new["bg"])
+                except tk.TclError:
+                    pass
+            for c in w.winfo_children():
+                visit(c)
+
+        visit(self.root)
+        # Checkbox images are drawn pixels, not widget colors.
+        self.img_off = self._box_image(0)
+        self.img_on = self._box_image(1)
+        self.img_some = self._box_image(2)
+        yview = self.tree.yview()
+        sel = self.tree.selection()
+        self._fill_tree()
+        if yview:
+            try:
+                self.tree.yview_moveto(yview[0])
+            except tk.TclError:
+                pass
+        keep = [i for i in sel if self.tree.exists(i)]
+        if keep:
+            self.tree.selection_set(keep)
+
+    def _box_image(self, kind):
+        """A tiny checkbox image: 0 = empty, 1 = ticked, 2 = partial.
+        Drawn in the current palette so it never sits as a light
+        square on a dark tree."""
+        pal = self._pal
         img = tk.PhotoImage(width=13, height=13)
-        img.put("#ffffff", to=(0, 0, 13, 13))
+        img.put(pal["check_fill"], to=(0, 0, 13, 13))
         for i in range(13):
-            img.put("#666666", to=(i, 0, i + 1, 1))
-            img.put("#666666", to=(i, 12, i + 1, 13))
-            img.put("#666666", to=(0, i, 1, i + 1))
-            img.put("#666666", to=(12, i, 13, i + 1))
+            img.put(pal["check_border"], to=(i, 0, i + 1, 1))
+            img.put(pal["check_border"], to=(i, 12, i + 1, 13))
+            img.put(pal["check_border"], to=(0, i, 1, i + 1))
+            img.put(pal["check_border"], to=(12, i, 13, i + 1))
         if kind == 1:
             for x, y in [(2, 6), (3, 7), (4, 8), (5, 9), (5, 10), (6, 7),
                          (6, 8), (7, 5), (8, 4), (9, 3), (10, 2), (10, 3)]:
-                img.put("#1a7f37", to=(x, y, x + 1, y + 1))
+                img.put(pal["check_tick"], to=(x, y, x + 1, y + 1))
         elif kind == 2:
-            img.put("#1a7f37", to=(3, 3, 10, 10))
+            img.put(pal["check_tick"], to=(3, 3, 10, 10))
         return img
 
     def _repo_check_state(self, label):

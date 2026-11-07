@@ -148,6 +148,40 @@ with tempfile.TemporaryDirectory() as td:
     assert app.load_settings(p)["hide_down"] is True
 print("settings migration OK")
 
+# --- theme: dark by default, light preserved, junk -> dark -------------------
+with tempfile.TemporaryDirectory() as td:
+    p = os.path.join(td, "settings.json")
+    with open(p, "w") as f:
+        json.dump({"repos": []}, f)
+    assert app.load_settings(p)["theme"] == "dark"
+    with open(p, "w") as f:
+        json.dump({"theme": "light", "repos": []}, f)
+    assert app.load_settings(p)["theme"] == "light"
+    with open(p, "w") as f:
+        json.dump({"theme": "sepia", "repos": []}, f)
+    assert app.load_settings(p)["theme"] == "dark"
+print("theme settings OK")
+
+# --- theme palettes: same keys, valid hex, readable contrast -----------------
+def _lum(hexs):
+    r, g, b = (int(hexs[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    f = lambda c: c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+
+
+assert set(app.THEMES["light"]) == set(app.THEMES["dark"])
+for _name, _pal in app.THEMES.items():
+    for _k, _v in _pal.items():
+        assert isinstance(_v, str) and len(_v) == 7 \
+            and _v.startswith("#"), (_name, _k, _v)
+    # text must read on its background: dark theme light ink on dark
+    # bg, light theme dark ink on light bg
+    assert (_lum(_pal["ink"]) > _lum(_pal["bg"])) == (_name == "dark"), _name
+assert app.THEMES["light"]["bg"] != app.THEMES["dark"]["bg"]
+assert app._norm_hex("#666") == "#666666"
+assert app._norm_hex("#ABCDEF") == "#abcdef"
+print("theme palettes OK")
+
 
 # --- fake GitHub ------------------------------------------------------------
 class FakeGH(app.GH):
