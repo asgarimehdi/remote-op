@@ -836,7 +836,9 @@ jobs:
           # the id. The baseURL is normalized here too (a manual
           # dispatch may send it raw): trailing slashes stripped,
           # a trailing /v1/models trimmed to /v1, /v1 appended
-          # unless already there. The block is written only for a
+          # unless already there or the base already ends in a
+          # version segment (/v2, /v4, ...), which is kept as-is.
+          # The block is written only for a
           # Custom run; a plain dispatch leaves whatever provider
           # block the restored config already had untouched (and
           # the model resolution below restores the Zen model).
@@ -849,7 +851,10 @@ jobs:
               _cu_base = _cu_base.rstrip("/")
               if _cu_base.endswith("/v1/models"):
                   _cu_base = _cu_base[:-len("/models")]
-              if not _cu_base.endswith("/v1"):
+              _cu_tail = _cu_base.rsplit("/", 1)[-1]
+              _cu_versioned = _cu_tail.startswith("v") \
+                  and _cu_tail[1:].isdigit()
+              if not _cu_base.endswith("/v1") and not _cu_versioned:
                   _cu_base = _cu_base + "/v1"
           # 9router provider: this machine's own 9router on
           # http://127.0.0.1:20128 (step 12 restores its db from the
@@ -1742,6 +1747,8 @@ def custom_models_url(base_url):
     """<base>/v1/models for a preset's base URL: trailing slashes
     stripped; a URL already ending in /v1/models is kept, one
     ending in /v1 gains /models, anything else gains /v1/models.
+    A URL already ending in a version segment (/v2, /v4, ...) gains
+    only /models, so a non-/v1 base like Z.ai's .../paas/v4 is kept.
     "" for a blank base URL (the caller then never fetches)."""
     base = (base_url or "").strip().rstrip("/")
     if not base:
@@ -1750,22 +1757,30 @@ def custom_models_url(base_url):
         return base
     if base.endswith("/v1"):
         return base + "/models"
+    _tail = base.rsplit("/", 1)[-1]
+    if _tail.startswith("v") and _tail[1:].isdigit():
+        return base + "/models"
     return base + "/v1/models"
 
 
 def custom_provider_base_url(base_url):
     """Provider baseURL for a preset's base URL: trailing slashes
     stripped; a trailing /v1/models is trimmed to /v1; /v1 is
-    appended unless already there. "" for a blank base URL. This
-    mirrors the normalization §4 applies on the runner."""
+    appended unless already there. A trailing version segment
+    (/v2, /v4, ...) is kept as-is, so a non-/v1 base like Z.ai's
+    .../paas/v4 is not mangled to .../v4/v1. "" for a blank base
+    URL. This mirrors the normalization §4 applies on the runner."""
     base = (base_url or "").strip().rstrip("/")
     if not base:
         return ""
     if base.endswith("/v1/models"):
         base = base[:-len("/models")]
-    if not base.endswith("/v1"):
-        base += "/v1"
-    return base
+    if base.endswith("/v1"):
+        return base
+    _tail = base.rsplit("/", 1)[-1]
+    if _tail.startswith("v") and _tail[1:].isdigit():
+        return base
+    return base + "/v1"
 
 
 def custom_model_ids(payload):

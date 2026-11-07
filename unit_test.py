@@ -893,6 +893,12 @@ assert app.custom_provider_base_url("https://api.example.com/") == "https://api.
 assert app.custom_provider_base_url("https://api.example.com/v1") == "https://api.example.com/v1"
 assert app.custom_provider_base_url("https://api.example.com/v1/models") == "https://api.example.com/v1"
 assert app.custom_provider_base_url("") == "" and app.custom_provider_base_url(None) == ""
+assert app.custom_models_url("https://api.z.ai/api/paas/v4") == "https://api.z.ai/api/paas/v4/models"
+assert app.custom_models_url("https://api.z.ai/api/paas/v4/") == "https://api.z.ai/api/paas/v4/models"
+assert app.custom_models_url("https://api.example.com/v2") == "https://api.example.com/v2/models"
+assert app.custom_provider_base_url("https://api.z.ai/api/paas/v4") == "https://api.z.ai/api/paas/v4"
+assert app.custom_provider_base_url("https://api.z.ai/api/paas/v4/") == "https://api.z.ai/api/paas/v4"
+assert app.custom_provider_base_url("https://api.example.com/v2") == "https://api.example.com/v2"
 print("custom base-URL normalization OK")
 
 # model ids: OpenAI-compatible list shape, no free filter
