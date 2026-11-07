@@ -147,8 +147,12 @@ and the same light theme.
   the deletion then runs in parallel across repos. One repo
   failing does not stop the others. Machines and state are
   untouched.
-- **Hide cancelled** — drops machines whose latest run ended
-  cancelled from the tree.
+- **Hide down** — when ticked, only machines that are fully up
+  (● UP) stay in the tree; down, starting and never-started
+  machines are hidden. The probe loop also re-fetches run
+  statuses every cycle (30s while anything is starting, else
+  5 minutes), so a stopped machine flips to ● DOWN by itself
+  instead of sitting on ◐ STARTING until the next manual Refresh.
 
 New instances start with a clean state and create
 `opencode/instances/<name>/` on their first sync.

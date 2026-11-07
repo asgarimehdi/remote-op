@@ -1426,6 +1426,19 @@ def ready_since(run, prev, now=None):
     return time.time() if now is None else now
 
 
+def map_runs_to_workflows(runs, inst, label):
+    """{(label, wf): run} — the newest run per workflow. The API
+    lists newest first, so the first match per workflow wins; a run
+    for a file that is no live workflow is ignored."""
+    out = {}
+    for r in runs:
+        for name, info in inst.items():
+            if r.get("path", "").endswith(info["file"]):
+                out.setdefault((label, name), r)
+                break
+    return out
+
+
 # ---------------------------------------------------------------------------
 # OpenRouter accounts (per-run choice at Run time)
 # ---------------------------------------------------------------------------
@@ -2159,7 +2172,7 @@ def load_settings(path=None):
         repos.append(e)
     return {"repos": repos,
             "active": data.get("active", "") if isinstance(data, dict) else "",
-            "hide_cancelled": bool(data.get("hide_cancelled"))
+            "hide_down": bool(data.get("hide_down"))
             if isinstance(data, dict) else False,
             "openrouter_accounts": normalize_openrouter_accounts(
                 data.get("openrouter_accounts"))
@@ -2351,10 +2364,17 @@ class GH:
 
     # -- actions -----------------------------------------------------------
     def list_runs(self, repo, per_page=100):
+        runs, _ok = self.list_runs_ok(repo, per_page)
+        return runs
+
+    def list_runs_ok(self, repo, per_page=100):
+        """(runs, ok): like list_runs, but ok is False when the API
+        call itself failed — so a caller can tell a real empty list
+        from a failed fetch and keep its old data."""
         code, d = self.api("GET", f"repos/{repo}/actions/runs?per_page={per_page}")
         if code != 200 or not isinstance(d, dict):
-            return []
-        return d.get("workflow_runs", [])
+            return [], False
+        return d.get("workflow_runs", []), True
 
     def list_completed_runs(self, repo, limit=500):
         """Completed runs only (GitHub refuses to delete active ones),
@@ -2871,6 +2891,8 @@ class App:
         self.runs = {}        # (label, wf) -> latest run dict
         self.uptime = {}      # (label, wf) -> (readiness state, since ts|None)
         self._loading = set()  # repo labels whose refresh is in flight
+        self._runs_refresh_failed = set()  # labels whose last loop
+        # run-refresh failed (logged once until it recovers)
         self.checked = set()   # (label, wf) ticked in the fleet tree
         self._op_lock = threading.Lock()
         self._op_desc = None
@@ -3017,11 +3039,11 @@ class App:
         self.btn_rename.pack(side=tk.LEFT, padx=2)
         ttk.Button(util, text="Connect", command=self.connect_selected).pack(side=tk.LEFT, padx=2)
         ttk.Button(util, text="🧹 Delete old runs (all)", command=self.delete_old_runs).pack(side=tk.LEFT, padx=2)
-        self.hide_cancelled_var = tk.BooleanVar(
-            value=bool(self.settings.get("hide_cancelled")))
-        ttk.Checkbutton(util, text="Hide cancelled",
-                        variable=self.hide_cancelled_var,
-                        command=self._toggle_hide_cancelled).pack(side=tk.LEFT, padx=6)
+        self.hide_down_var = tk.BooleanVar(
+            value=bool(self.settings.get("hide_down")))
+        ttk.Checkbutton(util, text="Hide down",
+                        variable=self.hide_down_var,
+                        command=self._toggle_hide_down).pack(side=tk.LEFT, padx=6)
         self.uptime_var = tk.StringVar(value="server check: —")
         tk.Label(util, textvariable=self.uptime_var, bg=BG,
                  fg=MUTED).pack(side=tk.LEFT, padx=6)
@@ -3243,8 +3265,8 @@ class App:
 
         self.bg(work)
 
-    def _toggle_hide_cancelled(self):
-        self.settings["hide_cancelled"] = bool(self.hide_cancelled_var.get())
+    def _toggle_hide_down(self):
+        self.settings["hide_down"] = bool(self.hide_down_var.get())
         try:
             save_settings(self.settings)
         except OSError as e:
@@ -3311,9 +3333,9 @@ class App:
                 info = inst[wf]
                 run = self.runs.get((label, wf), {})
                 status = run.get("status") or "—"
-                if (self.settings.get("hide_cancelled")
-                        and status not in ("in_progress", "queued")
-                        and run.get("conclusion") == "cancelled"):
+                srv_state = self._server_state(label, wf)
+                if (self.settings.get("hide_down")
+                        and srv_state != "ready"):
                     hidden += 1
                     continue
                 shown = status if status != "completed" else (run.get("conclusion") or "completed")
@@ -3321,7 +3343,6 @@ class App:
                 if run.get("created_at"):
                     started = datetime.fromisoformat(
                         run["created_at"].replace("Z", "+00:00")).astimezone().strftime("%H:%M")
-                srv_state = self._server_state(label, wf)
                 if status in ("in_progress", "queued"):
                     running += 1
                     mins = remaining_minutes(run.get("created_at"), info["timeout"])
@@ -3355,7 +3376,7 @@ class App:
                 total += 1
         self.status_var.set(f"{len(self.settings['repos'])} repo(s), "
                             f"{total} machine(s), {running} running"
-                            + (f", {hidden} cancelled hidden" if hidden else "")
+                            + (f", {hidden} down hidden" if hidden else "")
                             + (f" — loading {len(self._loading)} repo(s)…"
                                if self._loading else ""))
         self.checked_var.set(f"{len(self.checked)} checked"
@@ -3434,7 +3455,11 @@ class App:
     # (READY_PORTS: 9router + OpenCode + Laravel — Laravel boots
     # last). While a machine is still starting, the loop re-checks
     # every 30s so its row flips green the moment it is truly ready;
-    # a settled fleet is probed every 5 minutes.
+    # a settled fleet is probed every 5 minutes. The loop also
+    # re-fetches run statuses each cycle: a run that ended since the
+    # last refresh (a stopped machine's run still reads in_progress
+    # while the runner shuts down) must not keep its row orange
+    # forever — the probe reads the same runs the tree shows.
     def _uptime_loop(self):
         self.bg(self._check_uptime)
         starting = any(
@@ -3463,7 +3488,39 @@ class App:
             return all(ex.map(
                 lambda p: self._ping(f"http://{wf}:{p}"), READY_PORTS))
 
+    def _refresh_runs(self):
+        """Re-fetch every repo's runs (runs-only, no instances) so
+        the probe — and the tree — stop trusting a stale run status
+        after a run ends. A failed repo keeps its old runs; the
+        failure is logged once until it recovers. Runs are replaced
+        in one assignment, so the UI thread never sees a half-new
+        dict."""
+        new_runs = dict(self.runs)
+        for cfg in list(self.settings["repos"]):
+            label = cfg["label"]
+            inst = self.instances_of(label)
+            if not inst:
+                continue
+            runs, ok = GH(cfg["pat"]).list_runs_ok(cfg["repo"])
+            if not ok:
+                if label not in self._runs_refresh_failed:
+                    self._runs_refresh_failed.add(label)
+                    self.log(f"{label}: run refresh FAILED — keeping "
+                             f"last known runs")
+                continue
+            if label in self._runs_refresh_failed:
+                self._runs_refresh_failed.discard(label)
+                self.log(f"{label}: run refresh OK again")
+            for k in [k for k in new_runs if k[0] == label]:
+                del new_runs[k]
+            new_runs.update(map_runs_to_workflows(runs, inst, label))
+        self.runs = new_runs
+
     def _check_uptime(self):
+        # Runs first: a run that ended since the last refresh must
+        # not keep its row orange — the probe below derives its
+        # verdict from these runs.
+        self._refresh_runs()
         keys = list(self.instances.keys())
 
         def probe(key):

@@ -107,6 +107,18 @@ assert app.ready_since(_run, None) - app.ready_since(
     {"run_started_at": "2026-10-21T09:00:00Z"}, None) == 3600
 print("uptime anchor OK")
 
+# --- map runs to workflows: newest run per workflow ----------------------
+_inst = {"rey1": {"file": "rey1.yml"}, "rey2": {"file": "rey2.yml"}}
+_runs = [
+    {"id": 3, "path": ".github/workflows/rey1.yml", "status": "completed"},
+    {"id": 2, "path": ".github/workflows/rey1.yml", "status": "in_progress"},
+    {"id": 4, "path": ".github/workflows/rey2.yml", "status": "in_progress"},
+    {"id": 5, "path": ".github/workflows/gone.yml", "status": "completed"},
+]
+_m = app.map_runs_to_workflows(_runs, _inst, "t")
+assert _m == {("t", "rey1"): _runs[0], ("t", "rey2"): _runs[2]}, _m
+print("map runs to workflows OK")
+
 # --- settings migration ---------------------------------------------------
 with tempfile.TemporaryDirectory() as td:
     p = os.path.join(td, "settings.json")
@@ -124,6 +136,16 @@ with tempfile.TemporaryDirectory() as td:
     with open(p, "w") as f:
         f.write("{broken")
     assert app.load_settings(p)["repos"] == []
+    # hide_down replaces hide_cancelled: the old key is dropped on
+    # load (never carried into the rebuilt dict) and the new key
+    # defaults to off; a saved True survives a round-trip.
+    with open(p, "w") as f:
+        json.dump({"hide_cancelled": True, "repos": []}, f)
+    s = app.load_settings(p)
+    assert s["hide_down"] is False and "hide_cancelled" not in s, s
+    with open(p, "w") as f:
+        json.dump({"hide_down": True, "repos": []}, f)
+    assert app.load_settings(p)["hide_down"] is True
 print("settings migration OK")
 
 
@@ -182,6 +204,11 @@ class FakeGH(app.GH):
         return [{"id": rid, "path": f".github/workflows/{f}",
                  "status": "in_progress", "head_branch": "opc"}
                 for f, rid in self.active.items()]
+
+    def list_runs_ok(self, repo, per_page=100):
+        if getattr(self, "fail_runs", False):
+            return [], False
+        return self.list_runs(repo, per_page), True
 
     def cancel_run(self, repo, run_id):
         if run_id not in self.stuck:
