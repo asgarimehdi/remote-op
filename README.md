@@ -94,20 +94,13 @@ and the same light theme.
   anywhere to copy yet. The repo still needs the account's usual
   secrets (`MY_PAT`, `RUNNER_PASSWORD`, `TAILSCALE_AUTHKEY`) set by
   its owner before the first run can succeed.
-- **Raw or Copy — asked at every create** — the create dialog asks
-  how each new machine starts:
-  - **Copy of the first machine (warm start)** — the first machine's
-    backed-up per-instance state is cloned into the new machine in
-    the same commit, reusing the same git blobs (no re-upload):
-    `data/` (sessions and history), `cbm-cache/` (the
-    codebase-memory index) and `9router.sqlite` when present. The
-    new machine boots with the first machine's history instead of
-    starting blank. If the first machine has no backed-up state,
-    Copy falls back to Raw with a log line.
-  - **Raw** — clean state, created by the machine's own first sync.
-  
-  Plugins, skills, agents and MCP config need no copying either way:
-  they live in the shared `opencode/config` every instance uses.
+- **New machines always start Raw** — clean state, created by the
+  machine's own first sync. There is no Copy option any more:
+  machines never sync state back to the repo, so there is no
+  backed-up state anywhere to clone.
+
+  Plugins, skills, agents and MCP config need no copying: they live
+  in the shared `opencode/config` every instance uses.
 - **Delete checked** — tick any machines (across repos) and delete
   them all: each machine's workflow file plus ALL of its data under
   `opencode/instances/<name>/`, in **one commit per repo**. The

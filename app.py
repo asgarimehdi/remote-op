@@ -2562,7 +2562,7 @@ def cancel_and_wait(gh, repo, branch, wf, workflow_file, log):
     return False
 
 
-def create_instances(gh, cfg, count, log, mode="raw", prefix_hint=None):
+def create_instances(gh, cfg, count, log, prefix_hint=None):
     """Clone `count` new instances from the repo's FIRST machine.
 
     The template is the lowest-numbered instance's workflow file (or,
@@ -2575,21 +2575,14 @@ def create_instances(gh, cfg, count, log, mode="raw", prefix_hint=None):
     git-tree commit. Returns the created instance names ([] when
     nothing was created).
 
-    mode="copy" also clones the template's backed-up per-instance
-    state — every blob under opencode/instances/<template>/ (data/:
-    sessions & history, cbm-cache/: the codebase-memory index, and
-    9router.sqlite when present) — into each new instance's state
-    dir, reusing the same blob SHAs in the same single commit, so the
-    new machine boots fully warm instead of raw. (Plugins, skills,
-    agents and MCP config need no copying: they live in the SHARED
-    opencode/config every instance already uses.) When the template
-    has no backed-up state, copy degrades to raw with a log line.
-    mode="raw" is the old behaviour: clean state, created by the
-    instance's own first sync.
+    New machines always start raw (clean state), created by the
+    instance's own first sync: machines never sync state back to the
+    repo, so there is no backed-up state anywhere to copy. (Plugins,
+    skills, agents and MCP config need no copying: they live in the
+    SHARED opencode/config every instance already uses.)
     """
     repo, branch = cfg["repo"], cfg["branch"]
     inst = gh.list_instances(repo, branch)
-    embedded = False
     if inst:
         template_name = sorted(
             inst, key=lambda n: parse_instance_name(n)[1])[0]
@@ -2613,7 +2606,6 @@ def create_instances(gh, cfg, count, log, mode="raw", prefix_hint=None):
                 prefix_hint) else "op"
             template_name = f"{pfx}1"
             template_text = embedded_template(template_name, repo)
-            embedded = True
             log(f"repo is brand-new (no machines, none in git history) "
                 f"— bootstrapping from the workflow template embedded "
                 f"in Remote-Op, prefix '{pfx}' (change it later with "
@@ -2642,63 +2634,21 @@ def create_instances(gh, cfg, count, log, mode="raw", prefix_hint=None):
         log("create aborted: a blob upload FAILED (nothing committed)")
         return []
 
-    # Copy mode: snapshot the template's state entries ONCE (path,
-    # mode, blob sha). The commit below re-points those same blobs at
-    # each new instance's dir — nothing is re-uploaded, however large
-    # the state is.
-    src_state = []
-    if mode == "copy" and embedded:
-        log("copy mode: a brand-new repo has no backed-up state to "
-            "copy — creating raw (first sync creates the state)")
-    elif mode == "copy":
-        head = gh.ref_head(repo, branch)
-        if head:
-            prefix = f"opencode/instances/{template_name}/"
-            src_state = [e for e in gh.recursive_tree(repo, head)
-                         if e.get("type") == "blob"
-                         and e["path"].startswith(prefix)]
-        if src_state:
-            log(f"copy mode: cloning {template_name}'s backed-up state "
-                f"({len(src_state)} file(s): sessions/history, "
-                f"codebase-memory index, 9router db if present) into "
-                f"each new machine")
-        else:
-            log(f"copy mode: {template_name} has NO backed-up state "
-                f"under opencode/instances/{template_name}/ — creating "
-                f"raw instead (it never synced, or its state is gone)")
-
     def entries(_blobs):
         out = [{"path": f".github/workflows/{name}.yml", "mode": "100644",
                 "type": "blob", "sha": blob_sha[name]} for name in names]
-        if src_state:
-            src_prefix = f"opencode/instances/{template_name}/"
-            for name in names:
-                for e in src_state:
-                    out.append({
-                        "path": f"opencode/instances/{name}/"
-                                + e["path"][len(src_prefix):],
-                        "mode": e["mode"], "type": "blob",
-                        "sha": e["sha"]})
         return out
 
     msg = (f"Add {names[0]} workflow" if count == 1 else
            f"Add {count} instances from {template_name}: "
            f"{names[0]}..{names[-1]}")
-    if src_state:
-        msg += f" (state copied from {template_name})"
     if not gh.commit_tree_change(repo, branch, msg, entries, log):
         log("create FAILED — no instances were committed")
         return []
     for name in names:
-        if src_state:
-            log(f"✅ Created .github/workflows/{name}.yml + a full copy "
-                f"of {template_name}'s state in opencode/instances/"
-                f"{name}/ ({len(src_state)} file(s)) — {name} boots "
-                f"warm, with {template_name}'s history")
-        else:
-            log(f"✅ Created .github/workflows/{name}.yml — {name} "
-                f"starts with a clean state and creates "
-                f"opencode/instances/{name}/ on its first sync")
+        log(f"✅ Created .github/workflows/{name}.yml — {name} "
+            f"starts with a clean state and creates "
+            f"opencode/instances/{name}/ on its first sync")
     return names
 
 
@@ -3913,14 +3863,13 @@ class App:
         self._create_dialog(preset_count=None)
 
     def _create_dialog(self, preset_count):
-        """Create dialog: pick the repo, the count (preset 1 for Add),
-        and — asked every time — whether each new machine is RAW
-        (clean state) or a COPY of the first machine (its backed-up
-        state cloned: sessions/history, codebase-memory index and
-        9router db; plugins & skills are shared config and come along
-        either way). When the chosen repo has no machines, a prefix
-        field appears too: it names the machines when a brand-new
-        repo is bootstrapped from the embedded template."""
+        """Create dialog: pick the repo and the count (preset 1 for
+        Add). New machines always start raw (clean state, created by
+        their own first sync) — there is no Copy option: machines
+        never sync state back to the repo, so there is nothing to
+        copy. When the chosen repo has no machines, a prefix field
+        appears too: it names the machines when a brand-new repo is
+        bootstrapped from the embedded template."""
         cfg = self.scope_repo() or self.target_repo()
         if not cfg:
             self.log("add a repo first (Repos…)")
@@ -3928,7 +3877,7 @@ class App:
         win = tk.Toplevel(self.root)
         win.title("Add instance" if preset_count == 1
                   else "Create N from first machine")
-        win.geometry(f"500x500+{self.root.winfo_rootx() + 140}"
+        win.geometry(f"500x440+{self.root.winfo_rootx() + 140}"
                      f"+{self.root.winfo_rooty() + 90}")
         win.configure(bg=self.BG)
         frm = tk.Frame(win, bg=self.BG)
@@ -3953,32 +3902,17 @@ class App:
         prefix_ent = ttk.Entry(frm, textvariable=prefix_var, width=12)
         prefix_ent.grid(row=2, column=1, sticky="w", pady=3)
 
-        mode_var = tk.StringVar(value="copy")
-        tk.Label(frm, text="Start state:", bg=self.BG).grid(row=3, column=0, sticky="nw", pady=(8, 3))
-        modes = tk.Frame(frm, bg=self.BG)
-        modes.grid(row=3, column=1, sticky="w", pady=(8, 3))
-        tk.Radiobutton(modes, bg=self.BG, activebackground=self.BG,
-                       variable=mode_var, value="copy", wraplength=320,
-                       justify="left",
-                       text="Copy of the first machine — warm start "
-                            "(history, sessions, indexes, 9router db)"
-                       ).pack(anchor="w")
-        tk.Radiobutton(modes, bg=self.BG, activebackground=self.BG,
-                       variable=mode_var, value="raw", wraplength=320,
-                       justify="left",
-                       text="Raw — clean state, first sync creates it"
-                       ).pack(anchor="w")
         tk.Label(frm, text="Plugins, skills, agents and MCP config live "
                            "in the shared opencode/config — every new "
-                           "machine gets those either way.",
+                           "machine gets those.",
                  bg=self.BG, fg=self.MUTED, justify="left",
-                 wraplength=430).grid(row=4, column=0, columnspan=2,
+                 wraplength=430).grid(row=3, column=0, columnspan=2,
                                       sticky="w", pady=(2, 0))
 
         info_var = tk.StringVar(value="")
         tk.Label(frm, textvariable=info_var, bg=self.BG, fg=self.MUTED,
                  justify="left", wraplength=430).grid(
-                     row=5, column=0, columnspan=2, sticky="w", pady=(8, 2))
+                     row=4, column=0, columnspan=2, sticky="w", pady=(8, 2))
 
         def update_info(*_a):
             c = self.repo_by_label(repo_var.get())
@@ -4002,10 +3936,6 @@ class App:
             if n < 1 or n > 100:
                 info_var.set("Count must be between 1 and 100.")
                 return
-            mode_line = ("Each new machine also receives a full copy of "
-                         "the first machine's backed-up state."
-                         if mode_var.get() == "copy" else
-                         "New machines start raw (no state copied).")
             if inst:
                 first = sorted(inst, key=lambda x: parse_instance_name(x)[1])[0]
                 prefix = parse_instance_name(first)[0]
@@ -4014,7 +3944,8 @@ class App:
                 info_var.set(
                     f"Template (first machine): {first}\n"
                     f"Will create: {', '.join(names)}\n"
-                    f"{mode_line}\n"
+                    "New machines start raw (clean state, first sync "
+                    "creates it).\n"
                     f"(preview from the loaded fleet — numbers that only "
                     f"have a state dir are skipped too, so the final "
                     f"numbering is recomputed at run time)")
@@ -4030,17 +3961,16 @@ class App:
                     "for this repo.\n"
                     f"If it is brand-new, will create: "
                     f"{', '.join(names)}\n"
-                    "Copy falls back to raw in both cases: there is "
-                    "no live state to clone.")
+                    "New machines start raw (clean state, first sync "
+                    "creates it).")
 
         count_var.trace_add("write", update_info)
-        mode_var.trace_add("write", update_info)
         prefix_var.trace_add("write", update_info)
         combo.bind("<<ComboboxSelected>>", update_info)
         update_info()
 
         btns = tk.Frame(frm, bg=self.BG)
-        btns.grid(row=6, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        btns.grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         def go():
             try:
@@ -4052,7 +3982,6 @@ class App:
                 messagebox.showerror("Create", "Count must be between 1 and 100.", parent=win)
                 return
             c = self.repo_by_label(repo_var.get())
-            mode = mode_var.get()
             pfx = prefix_var.get().strip()
             if pfx and not valid_prefix(pfx):
                 messagebox.showerror(
@@ -4063,26 +3992,25 @@ class App:
                 return
             win.destroy()
             if c:
-                self._start_create(c, n, mode, prefix=pfx or None)
+                self._start_create(c, n, prefix=pfx or None)
 
         ttk.Button(btns, text="Create", style="Accent.TButton", command=go).pack(side=tk.LEFT, padx=2)
         ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.LEFT, padx=2)
 
-    def _start_create(self, cfg, count, mode="copy", prefix=None):
+    def _start_create(self, cfg, count, prefix=None):
         def work():
             if not self._acquire_op(
-                    f"create {count} instance(s) in {cfg['label']} "
-                    f"({mode})"):
+                    f"create {count} instance(s) in {cfg['label']}"):
                 return
             outcome = [f"{cfg['label']}: create FAILED — see log", False]
             try:
                 created = create_instances(GH(cfg["pat"]), cfg, count,
-                                           self.log, mode=mode,
+                                           self.log,
                                            prefix_hint=prefix)
                 if created:
                     outcome[:] = [f"{cfg['label']}: {len(created)} "
                                   f"instance(s) created "
-                                  f"({created[0]}..{created[-1]}, {mode})",
+                                  f"({created[0]}..{created[-1]})",
                                   True]
                     self.checked.update((cfg["label"], n) for n in created)
             finally:

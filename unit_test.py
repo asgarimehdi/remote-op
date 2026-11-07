@@ -278,12 +278,12 @@ assert "{{REPO}}" not in text
 assert app.workflow_instance(gh.files[".github/workflows/syd2.yml"]) == "syd2"
 print("bulk create on brand-new repo (embedded template) OK")
 
-# default prefix when none is hinted; copy mode degrades to raw there
+# default prefix when none is hinted
 gh = FakeGH({})
-created = app.create_instances(gh, CFG, 1, log, mode="copy")
+created = app.create_instances(gh, CFG, 1, log)
 assert created == ["op1"], created
 assert not any(p.startswith("opencode/instances/") for p in gh.files)
-print("brand-new repo default prefix + copy->raw OK")
+print("brand-new repo default prefix OK")
 
 # the embedded render carries the live fleets' identity pattern
 t = app.embedded_template("rey1", "Shabakebehdasht/my-opencode")
@@ -351,7 +351,9 @@ assert "opencode/instances/rey2/db.sqlite" in gh.files
 assert ".github/workflows/rey1.yml" not in gh.files
 print("bulk delete skip-on-stuck-run OK")
 
-# --- create with COPY mode: state cloned from the first machine ------------------
+# --- create never copies state, even when the template has some ------------
+# (Copy mode was removed: machines never sync state back to the repo,
+# so there is nothing to clone — a new machine always starts raw.)
 files = {".github/workflows/rey1.yml": SAMPLE,
          "opencode/instances/rey1/data/opencode.db": "sessions+history",
          "opencode/instances/rey1/data/shell/x/out.txt": "shell log",
@@ -359,41 +361,24 @@ files = {".github/workflows/rey1.yml": SAMPLE,
          "opencode/instances/rey1/9router.sqlite": "9router db",
          "opencode/config/skills/x.md": "shared"}
 gh = FakeGH(files)
-created = app.create_instances(gh, CFG, 1, log, mode="copy")
+created = app.create_instances(gh, CFG, 1, log)
 assert created == ["rey2"], created
-assert gh.commits == 1, gh.commits  # workflows + state in ONE commit
-assert gh.files["opencode/instances/rey2/data/opencode.db"] == "sessions+history"
-assert gh.files["opencode/instances/rey2/cbm-cache/h-dashboard.db"] == "cbm index"
-assert gh.files["opencode/instances/rey2/9router.sqlite"] == "9router db"
-assert gh.files["opencode/instances/rey2/data/shell/x/out.txt"] == "shell log"
-# the template's own state is untouched, config untouched
+assert gh.commits == 1, gh.commits
+assert not any(p.startswith("opencode/instances/rey2") for p in gh.files)
+# the template's own state and the shared config are untouched
 assert gh.files["opencode/instances/rey1/data/opencode.db"] == "sessions+history"
 assert gh.files["opencode/config/skills/x.md"] == "shared"
-print("create copy mode (state cloned, one commit) OK")
+print("create never copies state (raw only) OK")
 
-# bulk copy: every new machine gets the template's state
+# bulk create: same — no state cloned for any new machine
 gh = FakeGH(files)
-created = app.create_instances(gh, CFG, 3, log, mode="copy")
+created = app.create_instances(gh, CFG, 3, log)
 assert created == ["rey2", "rey3", "rey4"], created
-for n in ("rey2", "rey3", "rey4"):
-    assert gh.files[f"opencode/instances/{n}/9router.sqlite"] == "9router db"
+assert not any(p.startswith("opencode/instances/rey2") for p in gh.files)
+assert not any(p.startswith("opencode/instances/rey3") for p in gh.files)
+assert not any(p.startswith("opencode/instances/rey4") for p in gh.files)
 assert gh.commits == 1
-print("bulk create copy mode OK")
-
-# copy mode with NO backed-up state degrades to raw, still one commit
-gh = FakeGH({".github/workflows/rey1.yml": SAMPLE})
-created = app.create_instances(gh, CFG, 1, log, mode="copy")
-assert created == ["rey2"], created
-assert not any(p.startswith("opencode/instances/") for p in gh.files)
-assert gh.commits == 1
-print("copy mode without state -> raw fallback OK")
-
-# raw mode (default) never copies state
-gh = FakeGH(files)
-created = app.create_instances(gh, CFG, 1, log)
-assert created == ["rey2"] and not any(
-    p.startswith("opencode/instances/rey2") for p in gh.files)
-print("raw mode (default) OK")
+print("bulk create never copies state OK")
 
 # --- rename prefix in one commit ------------------------------------------------
 files = {}
