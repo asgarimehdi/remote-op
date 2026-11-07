@@ -183,37 +183,47 @@ on:
   workflow_dispatch:
     inputs:
       openrouter_account:
-        description: "OpenRouter account name (must exist in the OPENROUTER_KEYS secret JSON; empty = current Zen setup)"
+        description: "OpenRouter account name (must exist in the OPENROUTER_KEYS secret JSON; empty = default Zen + OpenCode account)"
         required: false
         default: ""
         type: string
       openrouter_model:
-        description: "OpenRouter model id, e.g. vendor/model:free (empty = current Zen setup)"
+        description: "OpenRouter model id, e.g. vendor/model:free (empty = default Zen + OpenCode account)"
         required: false
         default: ""
         type: string
       nvidia_account:
-        description: "NVIDIA account name (must exist in the NVIDIA_KEYS secret JSON; empty = current Zen setup)"
+        description: "NVIDIA account name (must exist in the NVIDIA_KEYS secret JSON; empty = default Zen + OpenCode account)"
         required: false
         default: ""
         type: string
       nvidia_model:
-        description: "NVIDIA NIM model id, e.g. nvidia/nemotron-3-ultra-550b-a55b (empty = current Zen setup)"
+        description: "NVIDIA NIM model id, e.g. nvidia/nemotron-3-ultra-550b-a55b (empty = default Zen + OpenCode account)"
         required: false
         default: ""
         type: string
       custom_preset:
-        description: "Custom preset name (must exist in the CUSTOM_KEYS secret JSON; empty = current Zen setup)"
+        description: "Custom preset name (must exist in the CUSTOM_KEYS secret JSON; empty = default Zen + OpenCode account)"
         required: false
         default: ""
         type: string
       custom_base_url:
-        description: "Custom preset base URL, e.g. https://api.example.com (empty = current Zen setup)"
+        description: "Custom preset base URL, e.g. https://api.example.com (empty = default Zen + OpenCode account)"
         required: false
         default: ""
         type: string
       custom_model:
-        description: "Custom preset model id, e.g. vendor/model (empty = current Zen setup)"
+        description: "Custom preset model id, e.g. vendor/model (empty = default Zen + OpenCode account)"
+        required: false
+        default: ""
+        type: string
+      opencode_account:
+        description: "OpenCode account name (must exist in the OPENCODE_KEYS secret JSON; Remote-Op sends the per-machine account automatically on a plain dispatch; empty = no Zen auth — fails fast)"
+        required: false
+        default: ""
+        type: string
+      nine_router:
+        description: "Set to \"true\" to run this machine on 9router/code instead of the default Zen + OpenCode account; empty = default"
         required: false
         default: ""
         type: string
@@ -517,7 +527,7 @@ jobs:
       # 12b. Per-run OpenRouter choice (Remote-Op dispatch inputs only).
       #     Runs ONLY when a dispatch carried an account name; a plain
       #     dispatch (or any other trigger) skips it and the run keeps
-      #     the current Zen setup. The token is NEVER sent in the
+      #     the default Zen + OpenCode account setup. The token is NEVER sent in the
       #     dispatch: it is read here from the OPENROUTER_KEYS secret
       #     (one JSON object, account name -> token, set by the repo
       #     owner), masked, and exported via $GITHUB_ENV so step 13
@@ -565,7 +575,7 @@ jobs:
       # 12c. Per-run NVIDIA choice (Remote-Op dispatch inputs only).
       #     Runs ONLY when a dispatch carried an account name; a plain
       #     dispatch (or any other trigger) skips it and the run keeps
-      #     the current Zen setup. Same shape as step 12b: the token is
+      #     the default Zen + OpenCode account setup. Same shape as step 12b: the token is
       #     NEVER sent in the dispatch — it is read here from the
       #     NVIDIA_KEYS secret (one JSON object, account name -> token,
       #     set by the repo owner), masked, and exported via
@@ -615,7 +625,7 @@ jobs:
       # 12d. Per-run Custom preset choice (Remote-Op dispatch inputs only).
       #     Runs ONLY when a dispatch carried a preset name; a plain
       #     dispatch (or any other trigger) skips it and the run keeps
-      #     the current Zen setup. Same shape as steps 12b/12c: the
+      #     the default Zen + OpenCode account setup. Same shape as steps 12b/12c: the
       #     token is NEVER sent in the dispatch — it is read here from
       #     the CUSTOM_KEYS secret (one JSON object, preset name ->
       #     token, set by the repo owner), masked, and exported via
@@ -669,12 +679,80 @@ jobs:
           print(f"Custom preset '{preset}' resolved for this run only")
           PYEOF_CU
 
+      # 12e. Default OpenCode account (Remote-Op dispatch inputs only).
+      #     Runs when a dispatch carried an account name — which is
+      #     EVERY plain dispatch from Remote-Op: it resolves the
+      #     per-machine account automatically (machine N -> account
+      #     N in settings order, wrapping) and sends only the NAME.
+      #     Same shape as steps 12b/12c: the token is NEVER sent in
+      #     the dispatch — it is read here from the OPENCODE_KEYS
+      #     secret (one JSON object, account name -> token, set by
+      #     the repo owner), masked, and exported via $GITHUB_ENV
+      #     so step 13 and the `opencode serve` process inherit
+      #     OPENCODE_API_KEY from the environment. The built-in
+      #     opencode provider authenticates from that variable, so
+      #     no key is written into opencode.json and no provider
+      #     block is needed — §4 just picks the per-instance Zen
+      #     model. Missing secret / bad JSON / unknown account all
+      #     fail fast, with the account name only in the message —
+      #     never the token or the JSON. A dispatch with no account
+      #     at all (e.g. a manual dispatch with no inputs) skips
+      #     this step; step 13's provider guard then fails fast
+      #     instead of letting the run 401 mid-run with no key.
+      - name: 12e. Resolve OpenCode account for this run
+        if: inputs.opencode_account != ''
+        env:
+          OPENCODE_KEYS: ${{ secrets.OPENCODE_KEYS }}
+          OPENCODE_ACCOUNT: ${{ inputs.opencode_account }}
+        run: |
+          python3 - <<'PYEOF_OA'
+          import json, os, sys
+          keys_raw = os.environ.get("OPENCODE_KEYS", "")
+          if not keys_raw:
+              print("::error::OPENCODE_KEYS secret is not set on this repo — "
+                    "set it (JSON: account name -> token) or dispatch with a provider choice")
+              sys.exit(1)
+          try:
+              keys = json.loads(keys_raw)
+          except Exception:
+              print("::error::OPENCODE_KEYS is not valid JSON")
+              sys.exit(1)
+          account = os.environ.get("OPENCODE_ACCOUNT", "")
+          token = keys.get(account) if isinstance(keys, dict) else None
+          if not isinstance(token, str) or not token:
+              print(f"::error::OpenCode account '{account}' not found in OPENCODE_KEYS")
+              sys.exit(1)
+          print("::add-mask::" + token)
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("OPENCODE_API_KEY=" + token + "\n")
+          print(f"OpenCode account '{account}' resolved for this run only")
+          PYEOF_OA
+
       - name: 13. Install OpenCode V2, restore state, configure MCPs + Superpowers plugin & start serve
         env:
           OPENCODE_SERVER_PASSWORD: ${{ secrets.RUNNER_PASSWORD }}
           OPENCODE_DISABLE_AUTOUPDATE: "true"
           GH_TOKEN: ${{ secrets.MY_PAT }}
+          NINE_ROUTER: ${{ inputs.nine_router }}
         run: |
+          # 0. Provider guard: every dispatch must carry a provider —
+          #    Remote-Op always sends one (a plain dispatch carries
+          #    the per-machine opencode_account, the 9router option
+          #    carries nine_router=true, and the other providers
+          #    carry their own inputs). A manual dispatch with no
+          #    inputs would otherwise boot the Zen model with no key
+          #    and fail mid-run with a 401; fail fast here with a
+          #    clear error instead. 12b/12c/12d/12e export their
+          #    signals via $GITHUB_ENV, so they are visible here.
+          if [ -z "${OPENCODE_API_KEY:-}" ] \
+              && [ -z "${OPENROUTER_MODEL:-}" ] \
+              && [ -z "${NVIDIA_MODEL:-}" ] \
+              && [ -z "${CUSTOM_MODEL:-}" ] \
+              && [ -z "${NINE_ROUTER:-}" ]; then
+            echo '::error::no provider selected — dispatch from Remote-Op, or pass opencode_account / nine_router / provider inputs'
+            exit 1
+          fi
+
           # 1. Install OpenCode V2 — npm package @opencode/cli (the v1
           #    package opencode-ai stays on the 1.x line forever). Same
           #    npm-global pattern as CodeGraph/9router, plus the
@@ -794,7 +872,7 @@ jobs:
           # + model). It wins over the per-instance file/variable/
           # built-in resolution below, for this run only: the runner's
           # config is never committed back, so the next plain dispatch
-          # restores the Zen model. The openrouter provider reads
+          # restores the Zen model + OpenCode account. The openrouter provider reads
           # OPENROUTER_API_KEY from the environment (step 12b), so no
           # key is written into this config.
           _or_raw = os.environ.get("OPENROUTER_MODEL", "").strip()
@@ -811,10 +889,11 @@ jobs:
           # the OpenCode ref is nvidia/<that id>. The block is written
           # only for an NVIDIA run; a plain dispatch leaves whatever
           # provider block the restored config already had untouched
-          # (and the model resolution below restores the Zen model).
+          # (and the model resolution below restores the Zen model +
+          # OpenCode account).
           # When several overrides are somehow set, Custom wins,
-          # then NVIDIA — the Run dialog only ever sends one
-          # provider's inputs.
+          # then NVIDIA, then OpenRouter, then 9router — the Run
+          # dialog only ever sends one provider's inputs.
           # The NIM id itself usually contains a slash (e.g.
           # nvidia/nemotron-3-ultra-550b-a55b), so the OpenCode ref
           # is nvidia/<NIM id> — three segments. A value already in
@@ -841,7 +920,8 @@ jobs:
           # The block is written only for a
           # Custom run; a plain dispatch leaves whatever provider
           # block the restored config already had untouched (and
-          # the model resolution below restores the Zen model).
+          # the model resolution below restores the Zen model +
+          # OpenCode account).
           _cu_raw = os.environ.get("CUSTOM_MODEL", "").strip()
           _cu_base = os.environ.get("CUSTOM_BASE_URL", "").strip()
           _cu_id = _cu_raw[len("custom/"):] \
@@ -864,10 +944,16 @@ jobs:
           # across the combo's models. The key comes from the
           # HERMES_CUSTOM_API_KEY repo secret (job env
           # NINE_ROUTER_API_KEY); its value must match an apiKey in
-          # the restored db or 9router answers 401. A plain dispatch
-          # uses 9router/code; a per-run provider choice above still
-          # wins for that run only.
+          # the restored db or 9router answers 401. 9router/code is
+          # used ONLY when the dispatch explicitly chose it (the
+          # nine_router input = "true", sent by Remote-Op's 9router
+          # option); a plain dispatch uses the per-instance Zen
+          # model with the OpenCode account's key (step 12e). A
+          # per-run provider choice above still wins for that run
+          # only. Choosing 9router with no 9router key is a
+          # misconfiguration — fail fast here, not 401 mid-run.
           _nr_key = os.environ.get("NINE_ROUTER_API_KEY", "").strip()
+          _nr_flag = os.environ.get("NINE_ROUTER", "").strip().lower() == "true"
           # The default model is PER-INSTANCE and comes from the
           # opencode/default-models.txt file in this repo: one full
           # model id per line (# comments and blank lines ignored).
@@ -932,7 +1018,13 @@ jobs:
               cfg["model"] = _nv_model
           elif _or_model:
               cfg["model"] = _or_model
-          elif _nr_key:
+          elif _nr_flag:
+              if not _nr_key:
+                  print("::error::nine_router was chosen but "
+                        "NINE_ROUTER_API_KEY is not set — set the "
+                        "HERMES_CUSTOM_API_KEY secret or dispatch with "
+                        "another provider")
+                  raise SystemExit(1)
               _prov = cfg.setdefault("provider", {})
               _nr = _prov.setdefault("9router", {})
               _nr["npm"] = "@ai-sdk/openai-compatible"
@@ -1084,19 +1176,21 @@ jobs:
                                 ("glm", "opencode/glm-5.3-flash-free")):
               councillors.setdefault(cname, {})["model"] = cmodel
           # Provider override (same CUSTOM_MODEL / NVIDIA_MODEL /
-          # OPENROUTER_MODEL as §4, Custom checked first, then
-          # NVIDIA): EVERY slim seat — agents, council and
-          # councillors — on the chosen model for this run only,
-          # and the preset forced to "free" so these seats are the
-          # ones actually used. The runner's slim config is never
-          # committed back, so the next plain dispatch restores the
-          # seats below. A plain dispatch (no per-run choice) puts
-          # every seat on the local 9router combo, the same
-          # 9router/code as §4's main model — NINE_ROUTER_API_KEY
-          # set means the key is present.
+          # OPENROUTER_MODEL / NINE_ROUTER as §4, Custom checked
+          # first, then NVIDIA, then OpenRouter, then 9router):
+          # EVERY slim seat — agents, council and councillors — on
+          # the chosen model for this run only, and the preset
+          # forced to "free" so these seats are the ones actually
+          # used. The runner's slim config is never committed back,
+          # so the next plain dispatch restores the seats below. A
+          # plain dispatch (no per-run choice) leaves every seat on
+          # its free Zen model below; only an explicit 9router
+          # choice (nine_router input) puts every seat on
+          # 9router/code, the same as §4's main model.
           _cu_raw = os.environ.get("CUSTOM_MODEL", "").strip()
           _nv_raw = os.environ.get("NVIDIA_MODEL", "").strip()
           _or_raw = os.environ.get("OPENROUTER_MODEL", "").strip()
+          _nr_flag = os.environ.get("NINE_ROUTER", "").strip().lower() == "true"
           _override = ""
           if _cu_raw:
               _cu_id = _cu_raw[len("custom/"):] \
@@ -1108,7 +1202,7 @@ jobs:
               _override = "nvidia/" + _nv_id
           elif _or_raw:
               _override = "openrouter/" + _or_raw if not _or_raw.startswith("openrouter/") else _or_raw
-          elif os.environ.get("NINE_ROUTER_API_KEY", "").strip():
+          elif _nr_flag:
               _override = "9router/code"
           if _override:
               for _seat in list(free_preset.values()):
@@ -1897,6 +1991,129 @@ def move_custom_preset(presets, idx, delta):
 
 
 # ---------------------------------------------------------------------------
+# OpenCode accounts (the DEFAULT provider at Run time)
+# ---------------------------------------------------------------------------
+# Mirrors the OpenRouter accounts above: same settings shape, same
+# per-machine mapping, same JSON-secret delivery. The difference is
+# that this is the DEFAULT, not a per-run pick: a plain dispatch
+# (the "OpenCode (Zen — current setup)" radio, pre-selected in the
+# Run dialog) uses each machine's per-instance Zen model — the
+# model is NEVER picked here — and only the AUTH comes from the
+# account: machine N uses the Nth account's key, automatically.
+# The token is NEVER sent in the dispatch — the runner reads it
+# from the one JSON OPENCODE_KEYS secret per fleet repo in step
+# 12e, which exports OPENCODE_API_KEY for the built-in opencode
+# provider (no provider block, no model input). 9router is a
+# separate explicit Run choice now, not the default.
+
+OPENCODE_KEYS_SECRET = "OPENCODE_KEYS"
+
+
+def blank_opencode_account():
+    return {"name": "", "token": ""}
+
+
+def normalize_opencode_accounts(accounts):
+    """Settings-shape OpenCode accounts: drop entries with no name,
+    trim name/token, keep the FIRST entry per name. Tokens are never
+    logged or echoed anywhere in this app."""
+    seen, out = set(), []
+    for a in accounts or []:
+        if not isinstance(a, dict):
+            continue
+        name = str(a.get("name", "")).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append({"name": name,
+                    "token": str(a.get("token", "")).strip()})
+    return out
+
+
+def opencode_account_names(accounts):
+    return [a["name"] for a in normalize_opencode_accounts(accounts)]
+
+
+def move_opencode_account(accounts, idx, delta):
+    """Same list-order move as move_openrouter_account, for the
+    OpenCode accounts: list order IS the machine mapping."""
+    return _move_account_entry(accounts, idx, delta)
+
+
+def opencode_token_from_keys(keys_json, account):
+    """Mirror of the runner-side lookup in step 12e: the token for
+    `account` in an OPENCODE_KEYS JSON object, else None. Malformed
+    JSON, a non-object, or a non-string/empty token all yield None."""
+    try:
+        keys = json.loads(keys_json or "")
+    except Exception:
+        return None
+    if not isinstance(keys, dict):
+        return None
+    token = keys.get(account)
+    return token if isinstance(token, str) and token else None
+
+
+def opencode_keys_json(accounts):
+    """The OPENCODE_KEYS secret content for the configured
+    accounts: {name: token}. Only accounts with both a name and a
+    token are included; callers copy this to paste into GitHub."""
+    return json.dumps(
+        {a["name"]: a["token"]
+         for a in normalize_opencode_accounts(accounts)
+         if a["token"]},
+        indent=2, ensure_ascii=False)
+
+
+def opencode_account_for_instance(wf_name, accounts):
+    """Account NAME for one machine, by its trailing instance
+    number — the same rule as OpenRouter (machine 1 -> 1st
+    account, wrapping modulo the count). None when no accounts
+    are configured. Only the NAME is ever returned."""
+    return _account_name_for_instance(
+        wf_name, opencode_account_names(accounts))
+
+
+def opencode_dispatch_inputs(choice):
+    """workflow_dispatch inputs for an OpenCode Run choice: None
+    (run as-is) -> no inputs at all; ("opencode", account) -> only
+    the account NAME. The token is NEVER an input, and there is no
+    model input — the model stays the per-instance Zen model."""
+    if not choice:
+        return {}
+    account = choice[1] if isinstance(choice, tuple) \
+        and len(choice) == 2 else None
+    return {"opencode_account": account} if account else {}
+
+
+def opencode_dispatch_inputs_for_machine(choice, wf, accounts):
+    """workflow_dispatch inputs for ONE machine. choice is None /
+    "asis" -> {}; ("opencode",) -> the account resolved for wf's
+    instance number, or {} when no account resolves (the caller
+    must NOT dispatch in that case — no silent 9router fallback
+    hides the misconfiguration); ("opencode", account) -> that
+    account."""
+    if not choice or choice == "asis":
+        return {}
+    if isinstance(choice, tuple) and choice and choice[0] == "opencode":
+        if len(choice) == 1:
+            account = opencode_account_for_instance(wf, accounts)
+            if account is None:
+                return {}
+            return {"opencode_account": account}
+        return opencode_dispatch_inputs(choice)
+    return {}
+
+
+def nine_router_dispatch_inputs():
+    """workflow_dispatch inputs for the explicit 9router Run
+    choice: the nine_router flag only — fixed 9router/code, no
+    account, no model. The 9router key still comes from the job
+    env (HERMES_CUSTOM_API_KEY secret)."""
+    return {"nine_router": "true"}
+
+
+# ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
 
@@ -1952,6 +2169,9 @@ def load_settings(path=None):
             if isinstance(data, dict) else [],
             "custom_presets": normalize_custom_presets(
                 data.get("custom_presets"))
+            if isinstance(data, dict) else [],
+            "opencode_accounts": normalize_opencode_accounts(
+                data.get("opencode_accounts"))
             if isinstance(data, dict) else []}
 
 
@@ -2756,6 +2976,7 @@ class App:
         self.repo_combo.pack(side=tk.LEFT, padx=6)
         self.repo_combo.bind("<<ComboboxSelected>>", self._on_repo_switch)
         ttk.Button(top, text="Repos…", command=self._repos_dialog).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="OpenCode accounts…", command=self._opencode_dialog).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="OpenRouter accounts…", command=self._openrouter_dialog).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="NVIDIA accounts…", command=self._nvidia_dialog).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="Custom presets…", command=self._custom_dialog).pack(side=tk.LEFT, padx=2)
@@ -3326,17 +3547,27 @@ class App:
             return
         or_accounts = self.settings.get("openrouter_accounts", [])
         nv_accounts = self.settings.get("nvidia_accounts", [])
+        oc_accounts = self.settings.get("opencode_accounts", [])
         cu_presets = normalize_custom_presets(
             self.settings.get("custom_presets", []))
         is_custom = isinstance(choice, tuple) and bool(choice) \
             and choice[0] == "custom"
         is_nvidia = isinstance(choice, tuple) and bool(choice) \
             and choice[0] == "nvidia"
+        is_opencode = isinstance(choice, tuple) and bool(choice) \
+            and choice[0] == "opencode"
+        is_9router = isinstance(choice, tuple) and bool(choice) \
+            and choice[0] == "9router"
         if is_custom:
             inputs = custom_dispatch_inputs(choice, cu_presets)
         elif is_nvidia:
             inputs = nvidia_dispatch_inputs_for_machine(
                 choice, wf, nv_accounts)
+        elif is_opencode:
+            inputs = opencode_dispatch_inputs_for_machine(
+                choice, wf, oc_accounts)
+        elif is_9router:
+            inputs = nine_router_dispatch_inputs()
         else:
             inputs = openrouter_dispatch_inputs_for_machine(
                 choice, wf, or_accounts)
@@ -3345,6 +3576,11 @@ class App:
                 self.log(f"{cfg['label']}/{wf}: no Custom preset "
                          f"configured — add presets in 'Custom "
                          f"presets…' or run as-is; NOT dispatched")
+            elif is_opencode:
+                self.log(f"{cfg['label']}/{wf}: no OpenCode account "
+                         f"configured — add accounts in 'OpenCode "
+                         f"accounts…' or pick another provider; "
+                         f"NOT dispatched")
             else:
                 provider = "NVIDIA" if is_nvidia else "OpenRouter"
                 self.log(f"{cfg['label']}/{wf}: no {provider} account "
@@ -3352,16 +3588,22 @@ class App:
                          f"accounts…' or run as-is; NOT dispatched")
             return
         if GH(cfg["pat"]).dispatch(cfg["repo"], cfg["branch"], info["file"], inputs):
-            if inputs:
+            if "nine_router" in inputs:
+                self.log(f"{cfg['label']}/{wf}: dispatched "
+                         f"(9router: 9router/code)")
+            elif inputs:
                 account = inputs.get("nvidia_account") \
                     or inputs.get("openrouter_account") \
-                    or inputs.get("custom_preset")
+                    or inputs.get("custom_preset") \
+                    or inputs.get("opencode_account")
                 model = inputs.get("nvidia_model") \
                     or inputs.get("openrouter_model") \
-                    or inputs.get("custom_model")
+                    or inputs.get("custom_model") \
+                    or "Zen (per-instance)"
                 provider = "Custom" if "custom_preset" in inputs \
                     else ("NVIDIA" if "nvidia_account" in inputs
-                          else "OpenRouter")
+                          else ("OpenCode" if "opencode_account" in inputs
+                                else "OpenRouter"))
                 self.log(f"{cfg['label']}/{wf}: dispatched "
                          f"({provider}: {account} / {model})")
             else:
@@ -3387,7 +3629,7 @@ class App:
         if picked is None:
             self.log("run cancelled — nothing dispatched")
             return
-        choice = None if picked == "asis" else picked
+        choice = picked
 
         def work():
             self._dispatch_many(targets, choice)
@@ -3405,7 +3647,7 @@ class App:
         if picked is None:
             self.log("run cancelled — nothing dispatched")
             return
-        choice = None if picked == "asis" else picked
+        choice = picked
 
         def work():
             self._dispatch_many(targets, choice)
@@ -3977,10 +4219,15 @@ class App:
         mapping for the selected provider. Custom is the exception:
         ONE preset is picked here for the whole run (every machine
         uses it) and its model is only the default — it may still
-        be changed in this dialog.
+        be changed in this dialog. OpenCode is the default: the
+        pre-selected radio — each machine's per-instance Zen model
+        with its OpenCode account's key, no model to pick. 9router
+        is an explicit choice: fixed 9router/code, no account or
+        model to pick.
 
-        Returns None (cancel — nothing is dispatched), "asis"
-        (OpenCode/Zen: the current per-instance setup, no inputs),
+        Returns None (cancel — nothing is dispatched),
+        ("opencode",) (default: per-instance Zen + per-machine
+        OpenCode account), ("9router",) (fixed 9router/code),
         ("openrouter", model), ("nvidia", model), or ("custom",
         preset, model) — the provider and the model slug for this
         run only. Tokens are never part of the return value: the
@@ -3994,10 +4241,13 @@ class App:
             self.settings.get("openrouter_accounts", []))
         nv_accounts = normalize_nvidia_accounts(
             self.settings.get("nvidia_accounts", []))
+        oc_accounts = normalize_opencode_accounts(
+            self.settings.get("opencode_accounts", []))
         cu_presets = normalize_custom_presets(
             self.settings.get("custom_presets", []))
         or_names = [a["name"] for a in or_accounts]
         nv_names = [a["name"] for a in nv_accounts]
+        oc_names = [a["name"] for a in oc_accounts]
         cu_names = [a["name"] for a in cu_presets]
         result = {"value": None}
         win = tk.Toplevel(self.root)
@@ -4013,12 +4263,14 @@ class App:
         tk.Label(win, text="Provider (this run only):",
                  anchor="w").pack(fill=tk.X, padx=10, pady=(10, 2))
         # Zen (OpenCode) is the default: a plain Run uses each
-        # machine's per-instance Zen model with no inputs sent.
+        # machine's per-instance Zen model with its OpenCode
+        # account's key, resolved per machine at dispatch.
         provider_var = tk.StringVar(value="opencode")
         radios = tk.Frame(win)
         radios.pack(fill=tk.X, padx=10)
         for _value, _label in (
-                ("opencode", "OpenCode (Zen — current setup)"),
+                ("opencode", "OpenCode (Zen)"),
+                ("9router", "9router"),
                 ("openrouter", "OpenRouter"),
                 ("nvidia", "NVIDIA"),
                 ("custom", "Custom…")):
@@ -4036,11 +4288,13 @@ class App:
                                     width=40)
         preset_combo.pack(side=tk.LEFT, padx=4)
 
-        tk.Label(win, text="OpenRouter / NVIDIA: the account per machine "
-                          "is automatic (machine 1 → 1st account, "
-                          "machine 2 → 2nd, and so on, wrapping). "
-                          "Custom: one preset for the whole run, "
-                          "picked above.",
+        tk.Label(win, text="OpenCode (default): per-instance Zen model + "
+                          "the machine's OpenCode account (machine 1 → "
+                          "1st account, machine 2 → 2nd, and so on, "
+                          "wrapping). 9router: fixed 9router/code. "
+                          "OpenRouter / NVIDIA: the account per machine "
+                          "is automatic. Custom: one preset for the whole "
+                          "run, picked above.",
                  fg="#666", wraplength=520, justify="left",
                  anchor="w").pack(fill=tk.X, padx=10, pady=(6, 2))
         preview_var = tk.StringVar()
@@ -4050,9 +4304,32 @@ class App:
         def update_preview():
             provider = provider_var.get()
             if provider == "opencode":
-                preview_var.set("Zen: each machine keeps its per-instance "
-                                "model (default-models.txt / variable / "
-                                "built-in list). No inputs are sent.")
+                if targets and oc_names:
+                    seen = []
+                    for _cfg, _wf in targets:
+                        if _wf not in seen:
+                            seen.append(_wf)
+                    preview = ", ".join(
+                        f"{wf} → {opencode_account_for_instance(wf, oc_accounts)}"
+                        for wf in seen[:10])
+                    if len(seen) > 10:
+                        preview += f", … (+{len(seen) - 10} more)"
+                    preview_var.set("This run (Zen, per-instance model): "
+                                    + preview)
+                elif not oc_names:
+                    preview_var.set("No OpenCode accounts yet — add them "
+                                    "in 'OpenCode accounts…' (top bar), or "
+                                    "pick another provider.")
+                else:
+                    preview_var.set("Zen: each machine keeps its "
+                                    "per-instance model "
+                                    "(default-models.txt / variable / "
+                                    "built-in list).")
+                return
+            if provider == "9router":
+                preview_var.set("9router: every machine in this run uses "
+                                "9router/code (the local 9router combo). "
+                                "No account or model to pick.")
                 return
             if provider == "custom":
                 if not cu_names:
@@ -4202,7 +4479,18 @@ class App:
             if provider == "opencode":
                 list_label_var.set(
                     "Model: none to pick for OpenCode (Zen).")
-                status_var.set("Run uses each machine's Zen model.")
+                if not oc_names:
+                    status_var.set("No OpenCode accounts — add them "
+                                   "first, or pick another provider.")
+                else:
+                    status_var.set("Run uses each machine's Zen model "
+                                   "+ its OpenCode account.")
+                lb.delete(0, tk.END)
+            elif provider == "9router":
+                list_label_var.set(
+                    "Model: none to pick for 9router (fixed "
+                    "9router/code).")
+                status_var.set("Run uses 9router/code for every machine.")
                 lb.delete(0, tk.END)
             elif provider == "custom":
                 list_label_var.set(
@@ -4282,7 +4570,15 @@ class App:
         def run_provider():
             provider = provider_var.get()
             if provider == "opencode":
-                finish("asis")
+                if not oc_names:
+                    status_var.set("No OpenCode accounts — add them in "
+                                   "'OpenCode accounts…' first, "
+                                   "or pick another provider.")
+                    return
+                finish(("opencode",))
+                return
+            if provider == "9router":
+                finish(("9router",))
                 return
             if provider == "custom":
                 if not cu_names:
@@ -4595,6 +4891,171 @@ class App:
                 return
             self.log(f"OpenRouter accounts saved "
                      f"({len(self.settings['openrouter_accounts'])} account(s); "
+                     f"tokens are never logged).")
+            win.destroy()
+
+        tk.Button(btns, text="New", command=new_account).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Delete", command=del_account).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Move up",
+                  command=lambda: move_account(-1)).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Move down",
+                  command=lambda: move_account(1)).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Copy JSON for GitHub Secret",
+                  command=copy_json).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="Save & close",
+                  command=save_close).pack(side=tk.LEFT, padx=10)
+        if accounts:
+            lb.selection_set(0)
+            load_fields(0)
+        else:
+            new_account()
+
+    # -- opencode accounts dialog -------------------------------------------------------
+    def _opencode_dialog(self):
+        """Manage the OpenCode accounts stored in settings.json
+        (name + token, like the OpenRouter accounts). The LIST
+        ORDER is the machine mapping: machine 1 uses the 1st
+        account, machine 2 the 2nd, and so on (wrapping) — a plain
+        Run uses each machine's per-instance Zen model and only
+        the AUTH comes from its account. The token is NEVER sent by
+        this app at dispatch and never logged: the runner reads it
+        from the OPENCODE_KEYS GitHub Secret, and Remote-Op sends
+        only the account name. 'Copy JSON' builds that secret's
+        content from these accounts for pasting into GitHub — set
+        the secret yourself, in each fleet repo."""
+        accounts = self.settings.setdefault("opencode_accounts", [])
+        self.settings["opencode_accounts"] = normalize_opencode_accounts(accounts)
+        accounts = self.settings["opencode_accounts"]
+        win = tk.Toplevel(self.root)
+        win.title("OpenCode accounts")
+        win.geometry("720x400")
+        lb = tk.Listbox(win, width=24)
+        lb.pack(side=tk.LEFT, fill=tk.Y, padx=6, pady=6)
+        for a in accounts:
+            lb.insert(tk.END, a["name"])
+
+        form = tk.Frame(win)
+        form.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=6, pady=6)
+        vars_ = {}
+        rows = [("name", "Name", 30, False),
+                ("token", "Token", 46, True)]
+        for key, title, w, secret in rows:
+            r = tk.Frame(form)
+            r.pack(fill=tk.X, pady=2)
+            tk.Label(r, text=title, width=12, anchor="w").pack(side=tk.LEFT)
+            v = tk.StringVar()
+            tk.Entry(r, textvariable=v, width=w,
+                     show="•" if secret else "").pack(side=tk.LEFT)
+            vars_[key] = v
+        tk.Label(form, text="Tokens live in settings.json next to the exe "
+                            "(like PATs — keep the file private) and are "
+                            "never sent at dispatch. The runner reads the "
+                            "token from the OPENCODE_KEYS GitHub Secret "
+                            "(JSON: name -> token), which you set yourself "
+                            "in each fleet repo. 'Copy JSON' builds that "
+                            "secret's content from the accounts here. "
+                            "ORDER MATTERS: machine 1 uses the 1st account "
+                            "in this list, machine 2 the 2nd, and so on "
+                            "(wrapping when there are more machines than "
+                            "accounts) — reorder with Move up / Move down, "
+                            "without retyping a token. The model is NOT "
+                            "picked here: a plain Run keeps each machine's "
+                            "per-instance Zen model and only the key comes "
+                            "from its account.",
+                 fg="#666", wraplength=430,
+                 justify="left").pack(anchor="w", pady=4)
+        state = {"idx": None}
+
+        def load_fields(idx):
+            state["idx"] = idx
+            a = accounts[idx] if idx is not None else blank_opencode_account()
+            for k, v in vars_.items():
+                v.set(a.get(k, ""))
+
+        def flush():
+            if state["idx"] is None:
+                return
+            a = accounts[state["idx"]]
+            for k, v in vars_.items():
+                a[k] = v.get().strip()
+
+        def on_select(_evt=None):
+            flush()
+            sel = lb.curselection()
+            if sel:
+                load_fields(sel[0])
+
+        lb.bind("<<ListboxSelect>>", on_select)
+
+        btns = tk.Frame(form)
+        btns.pack(fill=tk.X, pady=8)
+
+        def new_account():
+            flush()
+            accounts.append(blank_opencode_account())
+            lb.insert(tk.END, "")
+            lb.selection_clear(0, tk.END)
+            lb.selection_set(tk.END)
+            load_fields(len(accounts) - 1)
+
+        def del_account():
+            sel = lb.curselection()
+            if not sel:
+                return
+            del accounts[sel[0]]
+            lb.delete(sel[0])
+            state["idx"] = None
+            load_fields(None)
+
+        def move_account(delta):
+            sel = lb.curselection()
+            if not sel:
+                return
+            flush()
+            new_idx = move_opencode_account(accounts, sel[0], delta)
+            if new_idx == sel[0]:
+                return
+            lb.delete(0, tk.END)
+            for a in accounts:
+                lb.insert(tk.END, a["name"])
+            lb.selection_clear(0, tk.END)
+            lb.selection_set(new_idx)
+            load_fields(new_idx)
+
+        def copy_json():
+            flush()
+            text = opencode_keys_json(accounts)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.log("OPENCODE_KEYS JSON copied — paste it as the "
+                     "OPENCODE_KEYS secret in each fleet repo "
+                     "(token values are never logged).")
+
+        def save_close():
+            if state["idx"] is None and any(
+                    v.get().strip() for v in vars_.values()):
+                accounts.append(blank_opencode_account())
+                lb.insert(tk.END, "")
+                state["idx"] = len(accounts) - 1
+            flush()
+            kept = [a for a in accounts if a.get("name")]
+            names = [a["name"] for a in kept]
+            if len(names) != len(set(names)):
+                messagebox.showerror(
+                    "Remote-Op",
+                    "Account names must be unique — rename the duplicate "
+                    "before saving.")
+                return
+            self.settings["opencode_accounts"] = normalize_opencode_accounts(kept)
+            try:
+                save_settings(self.settings)
+            except OSError as e:
+                messagebox.showerror(
+                    "Remote-Op",
+                    f"Could not save settings:\n{SETTINGS_PATH}\n\n{e}")
+                return
+            self.log(f"OpenCode accounts saved "
+                     f"({len(self.settings['opencode_accounts'])} account(s); "
                      f"tokens are never logged).")
             win.destroy()
 

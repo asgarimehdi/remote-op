@@ -29,44 +29,53 @@ and the same light theme.
   (across repos), or Run all / Stop all for one repo (the selected
   row's repo, else the target repo). Machines already running are
   skipped on dispatch; dispatch and cancel run in parallel.
-- **Provider choice at Run (OpenCode / OpenRouter / NVIDIA / Custom)** —
-  "OpenRouter accounts…" and "NVIDIA accounts…" (top bar) store
-  account names + tokens in `settings.json`, next to the PATs. The
-  LIST ORDER is the mapping: machine 1 uses the 1st account,
-  machine 2 the 2nd, and so on (wrapping when there are more
-  machines than accounts); reorder with Move up / Move down in
-  the accounts dialog, without retyping a token. "Custom
-  presets…" stores named presets for other providers' free
-  tokens — each preset has its own base URL, default model and
-  token (OpenAI-compatible endpoints only); at Run time ONE
-  preset is picked for the whole Run action and every machine
-  uses it, with the preset's model as the default (changeable
-  there). At Run time a dialog asks once per Run action for the
+- **Provider choice at Run (OpenCode / 9router / OpenRouter / NVIDIA / Custom)** —
+  "OpenCode accounts…", "OpenRouter accounts…" and "NVIDIA
+  accounts…" (top bar) store account names + tokens in
+  `settings.json`, next to the PATs. The LIST ORDER is the
+  mapping: machine 1 uses the 1st account, machine 2 the 2nd,
+  and so on (wrapping when there are more machines than
+  accounts); reorder with Move up / Move down in the accounts
+  dialog, without retyping a token. "Custom presets…" stores
+  named presets for other providers' free tokens — each preset
+  has its own base URL, default model and token
+  (OpenAI-compatible endpoints only); at Run time ONE preset is
+  picked for the whole Run action and every machine uses it,
+  with the preset's model as the default (changeable there).
+  At Run time a dialog asks once per Run action for the
   provider and ONLY the model — a free model from the live
   OpenRouter catalog (searchable, or type a model ID), a model
   from the live NVIDIA catalog (fetched with the first NVIDIA
   account's token, or type a model ID), a model from the live
   catalog of the picked Custom preset's base URL (fetched with
   that preset's token, or type a model ID — the preset's model
-  is the default when nothing is picked or typed), or OpenCode
-  with the current Zen setup — or cancel — and shows which
-  account each machine will use (or which Custom preset the run
-  uses). The choice applies to that run only: Remote-Op sends
-  only the account/preset name + model (+ base URL for Custom)
-  as `workflow_dispatch` inputs, and the runner reads the token
+  is the default when nothing is picked or typed), OpenCode
+  (the default, pre-selected: each machine's per-instance Zen
+  model with its OpenCode account's key — no model to pick), or
+  9router (fixed `9router/code` for every machine — no account
+  or model to pick) — or cancel — and shows which account each
+  machine will use (or which Custom preset the run uses). The
+  choice applies to that run only: Remote-Op sends only the
+  account/preset name + model (+ base URL for Custom) as
+  `workflow_dispatch` inputs, and the runner reads the token
   from the provider's GitHub Secret (one JSON object, name →
   token, set by the repo owner in each fleet repo —
-  `OPENROUTER_KEYS` for OpenRouter, `NVIDIA_KEYS` for NVIDIA,
-  `CUSTOM_KEYS` for Custom; each accounts/presets dialog's "Copy
-  JSON for GitHub Secret" builds it from the stored entries).
-  The workflow then runs OpenCode on the chosen model for the
-  main model and every slim agent seat, for that run only
+  `OPENCODE_KEYS` for OpenCode, `OPENROUTER_KEYS` for
+  OpenRouter, `NVIDIA_KEYS` for NVIDIA, `CUSTOM_KEYS` for
+  Custom; each accounts/presets dialog's "Copy JSON for GitHub
+  Secret" builds it from the stored entries). The workflow
+  then runs OpenCode on the chosen model for the main model and
+  every slim agent seat, for that run only
   (`openrouter/<model>` for OpenRouter; for NVIDIA the workflow
   writes an `nvidia` provider block pointing at the NVIDIA NIM
   endpoint and runs `nvidia/<model>`; for Custom it writes a
   `custom` provider block pointing at the preset's base URL and
-  runs `custom/<model>`); a plain dispatch keeps the per-instance
-  Zen model. Tokens are never sent in a dispatch, never logged,
+  runs `custom/<model>`; for 9router it writes a `9router`
+  provider block and runs `9router/code`); a plain dispatch
+  keeps the per-instance Zen model with the machine's OpenCode
+  account. With no OpenCode account configured, a plain dispatch
+  dispatches nothing (a clear log line instead of a silent
+  fallback). Tokens are never sent in a dispatch, never logged,
   and never committed.
 - **Add instance… / Create N from first…** — create one instance, or
   give a number (e.g. **10**) and create that many at once, cloned
@@ -190,8 +199,8 @@ skip-a-machine-whose-run-will-not-stop rule).
 
 ## Notes
 
-- `settings.json` holds PATs, passwords, OpenRouter/NVIDIA tokens and Custom preset tokens and is git-ignored — never
-  committed. The `OPENROUTER_KEYS` / `NVIDIA_KEYS` / `CUSTOM_KEYS` GitHub Secrets (JSON: account/preset name → token) are set by the
+- `settings.json` holds PATs, passwords, OpenCode/OpenRouter/NVIDIA tokens and Custom preset tokens and is git-ignored — never
+  committed. The `OPENCODE_KEYS` / `OPENROUTER_KEYS` / `NVIDIA_KEYS` / `CUSTOM_KEYS` GitHub Secrets (JSON: account/preset name → token) are set by the
   repo owner in each fleet repo; the dialog's "Copy JSON for GitHub Secret" builds it.
 - Instance identity inside a workflow file is exactly two spots —
   the workflow `name:` and the `WF_NAME:` env — and cloning rewrites

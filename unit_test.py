@@ -520,12 +520,13 @@ print("update workflows (checked/all, one commit, idempotent) OK")
 # Step 12 fetches the 9router db from the private keys repo instead of
 # restoring a per-instance file, and step 16b backs it up there on
 # shutdown — so 9router keys/combos survive, while the fleet repo still
-# never holds a db file. There is NO OPENCODE_API_KEY anywhere in the
-# template.
+# never holds a db file. OPENCODE_API_KEY enters the template only via
+# step 12e (masked + exported from the OPENCODE_KEYS secret for the
+# default Zen run; never a literal token, never a repo-level secret).
 _t = app.embedded_template("syd1", "haileen5/my-opencode")
 assert _t.startswith("# Managed by Remote-Op")
 assert "Sync opencode state" not in _t
-assert "OPENCODE_API_KEY" not in _t
+assert "OPENCODE_API_KEY" in _t  # step 12e only (see above)
 assert "Console smoke check" not in _t
 assert "Dropped stale 9router baseURL" not in _t
 assert "12. Fetch 9router db from keys repo" in _t
@@ -655,7 +656,7 @@ assert "openrouter_account:" in _t and "openrouter_model:" in _t
 assert "12b. Resolve OpenRouter account for this run only" in _t
 assert "OPENROUTER_KEYS" in _t and "OPENROUTER_API_KEY" in _t
 assert "::add-mask::" in _t
-assert "OPENCODE_API_KEY" not in _t  # the Zen key stays out (see above)
+assert "OPENCODE_API_KEY" in _t  # step 12e exports it (see above)
 assert "sk-or" not in _t  # no token literal anywhere in the template
 assert 'if: inputs.openrouter_account != ' in _t
 assert 'os.environ.get("OPENROUTER_MODEL"' in _t
@@ -854,7 +855,7 @@ assert 'os.environ.get("NVIDIA_MODEL"' in _t
 assert "@ai-sdk/openai-compatible" in _t
 assert "integrate.api.nvidia.com/v1" in _t
 assert "{env:NVIDIA_API_KEY}" in _t
-assert _t.count("::add-mask::") == 3  # steps 12b + 12c + 12d
+assert _t.count("::add-mask::") == 4  # steps 12b + 12c + 12d + 12e
 assert "nvapi-" not in _t  # no token literal anywhere in the template
 print("nvidia template (inputs + 12c + §4 provider block + §4c override) OK")
 
@@ -1091,12 +1092,133 @@ print("custom template (inputs + 12d + §4 provider block + §4c override) OK")
 
 print("openrouter template (inputs + 12b + §4/§4c override) OK")
 
+# --- OpenCode accounts: the DEFAULT provider ----------------------------------
+# settings: accounts migrate, round-trip, dedupe/drop malformed
+with tempfile.TemporaryDirectory() as td:
+    p = os.path.join(td, "settings.json")
+    with open(p, "w") as f:
+        json.dump({"repos": [], "opencode_accounts": [
+            {"name": " oc1 ", "token": " oc-1 "},
+            {"name": "oc1", "token": "dup"},
+            {"name": "", "token": "noname"},
+            {"name": "oc2", "token": ""},
+            "junk", None]}, f)
+    s = app.load_settings(p)
+    assert s["opencode_accounts"] == [
+        {"name": "oc1", "token": "oc-1"},
+        {"name": "oc2", "token": ""}], s["opencode_accounts"]
+    app.save_settings(s, p)
+    assert app.load_settings(p)["opencode_accounts"] == s["opencode_accounts"]
+    with open(p, "w") as f:
+        json.dump({"repo": "haileen5/my-opencode", "password": "pw"}, f)
+    assert app.load_settings(p)["opencode_accounts"] == []
+print("opencode settings migration OK")
+
+# secret lookup mirror + keys JSON + dispatch inputs + per-machine mapping
+_oc_keys = '{"a1": "oc-1", "a2": ""}'
+assert app.opencode_token_from_keys(_oc_keys, "a1") == "oc-1"
+assert app.opencode_token_from_keys(_oc_keys, "a2") is None
+assert app.opencode_token_from_keys(_oc_keys, "nope") is None
+assert app.opencode_token_from_keys("{broken", "a1") is None
+assert app.opencode_token_from_keys("[1,2]", "a1") is None
+assert app.opencode_token_from_keys('{"a1": 7}', "a1") is None
+assert json.loads(app.opencode_keys_json(
+    [{"name": "a1", "token": "oc-1"}, {"name": "a2", "token": ""}])) == {"a1": "oc-1"}
+_oc_accts = [{"name": "a1", "token": "t1"}, {"name": "a2", "token": "t2"},
+             {"name": "a3", "token": "t3"}]
+assert app.opencode_account_for_instance("syd1", _oc_accts) == "a1"
+assert app.opencode_account_for_instance("syd2", _oc_accts) == "a2"
+assert app.opencode_account_for_instance("syd4", _oc_accts) == "a1"  # wraps
+assert app.opencode_account_for_instance("op", _oc_accts) == "a1"  # no number
+assert app.opencode_account_for_instance("syd1", []) is None
+assert app.opencode_dispatch_inputs(None) == {}
+assert app.opencode_dispatch_inputs("asis") == {}
+assert app.opencode_dispatch_inputs(("opencode", "a2")) == {"opencode_account": "a2"}
+assert app.opencode_dispatch_inputs(("opencode",)) == {}
+assert app.opencode_dispatch_inputs_for_machine(
+    ("opencode",), "syd2", _oc_accts) == {"opencode_account": "a2"}
+assert app.opencode_dispatch_inputs_for_machine(
+    ("opencode",), "syd1", []) == {}
+assert app.opencode_dispatch_inputs_for_machine(
+    ("opencode", "a3"), "syd1", _oc_accts) == {"opencode_account": "a3"}
+assert app.opencode_dispatch_inputs_for_machine(
+    None, "syd1", _oc_accts) == {}
+assert app.opencode_dispatch_inputs_for_machine(
+    "asis", "syd1", _oc_accts) == {}
+assert app.opencode_dispatch_inputs_for_machine(
+    ("openrouter", "m"), "syd1", _oc_accts) == {}
+assert app.nine_router_dispatch_inputs() == {"nine_router": "true"}
+print("opencode normalize/lookup/inputs + per-machine mapping OK")
+
+# reorder helper mirrors the account ones (whole-entry swap, ends no-op)
+_oc_re = [{"name": "a1", "token": "t1"}, {"name": "a2", "token": "t2"},
+          {"name": "a3", "token": "t3"}]
+assert app.move_opencode_account(_oc_re, 1, -1) == 0
+assert [a["name"] for a in _oc_re] == ["a2", "a1", "a3"]
+assert [a["token"] for a in _oc_re] == ["t2", "t1", "t3"]
+assert app.move_opencode_account(_oc_re, 0, -1) == 0  # top: no-op
+assert app.move_opencode_account(_oc_re, 2, 1) == 2  # bottom: no-op
+assert app.move_opencode_account(_oc_re, 0, 1) == 1
+print("opencode account reorder OK")
+
+# dispatch routing: ("opencode",) resolves the per-machine account,
+# ("9router",) sends the flag, and no accounts means NO dispatch
+# (never a silent 9router fallback); the old providers still route.
+_app.settings["opencode_accounts"] = _oc_accts
+_app.instances[("t", "syd2")] = {"file": "syd2.yml"}
+_orig_GH = app.GH
+app.GH = _CapGH
+try:
+    _CapGH.seen = "NOT-CALLED"
+    _app._dispatch(CFG, "syd1", ("opencode",))
+    assert _CapGH.seen == {"opencode_account": "a1"}, _CapGH.seen
+    _app._dispatch(CFG, "syd2", ("opencode",))
+    assert _CapGH.seen == {"opencode_account": "a2"}, _CapGH.seen
+    _app.settings["opencode_accounts"] = []
+    _CapGH.seen = "NOT-CALLED"
+    _app._dispatch(CFG, "syd1", ("opencode",))
+    assert _CapGH.seen == "NOT-CALLED", _CapGH.seen
+    assert any("no OpenCode account configured" in l for l in logs), logs
+    _app.settings["opencode_accounts"] = _oc_accts
+    _CapGH.seen = "NOT-CALLED"
+    _app._dispatch(CFG, "syd1", ("9router",))
+    assert _CapGH.seen == {"nine_router": "true"}, _CapGH.seen
+    # the old providers still route: OpenRouter per-machine, plain as-is
+    _app.settings["openrouter_accounts"] = [
+        {"name": "o1", "token": "t1"}, {"name": "o2", "token": "t2"}]
+    _app._dispatch(CFG, "syd1", ("openrouter", "m:free"))
+    assert _CapGH.seen == {"openrouter_account": "o1",
+                           "openrouter_model": "m:free"}, _CapGH.seen
+    _app._dispatch(CFG, "syd1", None)
+    assert _CapGH.seen == {}, _CapGH.seen
+finally:
+    app.GH = _orig_GH
+print("opencode/9router dispatch routing (per-machine + no-account skip) OK")
+
+# template: opencode_account + nine_router inputs, step 12e fail-fast
+# lookup, §4 9router-on-flag-only + Zen default, §4c seats, step 13 guard
+_t = app.embedded_template("syd1", "haileen5/my-opencode")
+assert "opencode_account:" in _t and "nine_router:" in _t
+assert "12e. Resolve OpenCode account for this run" in _t
+assert "OPENCODE_KEYS" in _t and "OPENCODE_API_KEY" in _t
+assert 'if: inputs.opencode_account != ' in _t
+assert 'os.environ.get("NINE_ROUTER"' in _t
+assert 'NINE_ROUTER: ${{ inputs.nine_router }}' in _t
+assert "no provider selected" in _t
+assert "elif _nr_flag:" in _t
+assert '_nr_flag = os.environ.get("NINE_ROUTER"' in _t
+assert 'os.environ.get("NINE_ROUTER_API_KEY"' in _t  # key still feeds the block
+assert "opencode/deepseek-v4.1-flash-free" in _t  # Zen default intact
+assert "default-models.txt" in _t and "OPENCODE_DEFAULT_MODELS" in _t
+print("opencode template (inputs + 12e + §4/§4c flag + step 13 guard) OK")
+
 # --- 9router keys repo ----------------------------------------------------------
 # step 12 fetches the shared db from the account's private keys repo
-# (<owner>/my-9router), §4 serves it as the plain-dispatch provider
-# (9router/code), §4c puts every slim seat on it, and step 16b backs
-# it up there on shutdown. Per-run Custom/NVIDIA/OpenRouter still win;
-# a missing key falls back to the Zen models.
+# (<owner>/my-9router), §4 serves it ONLY on an explicit 9router
+# choice (nine_router input), §4c puts every slim seat on it then,
+# and step 16b backs it up there on shutdown. Per-run
+# Custom/NVIDIA/OpenRouter still win; a plain dispatch uses the
+# per-instance Zen model with the OpenCode account's key.
 _nr = app.embedded_template("syd1", "haileen5/my-opencode")
 assert "12. Fetch 9router db from keys repo" in _nr
 assert "haileen5/my-9router" in _nr and "Shabakebehdasht/my-9router" not in _nr
