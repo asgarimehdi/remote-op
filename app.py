@@ -4288,7 +4288,7 @@ class App:
                                     width=40)
         preset_combo.pack(side=tk.LEFT, padx=4)
 
-        tk.Label(win, text="OpenCode (default): per-instance Zen model + "
+        hint_label = tk.Label(win, text="OpenCode (default): per-instance Zen model + "
                           "the machine's OpenCode account (machine 1 → "
                           "1st account, machine 2 → 2nd, and so on, "
                           "wrapping). 9router: fixed 9router/code. "
@@ -4296,7 +4296,8 @@ class App:
                           "is automatic. Custom: one preset for the whole "
                           "run, picked above.",
                  fg="#666", wraplength=520, justify="left",
-                 anchor="w").pack(fill=tk.X, padx=10, pady=(6, 2))
+                 anchor="w")
+        hint_label.pack(fill=tk.X, padx=10, pady=(6, 2))
         preview_var = tk.StringVar()
         tk.Label(win, textvariable=preview_var, wraplength=520,
                  justify="left", anchor="w").pack(fill=tk.X, padx=10)
@@ -4474,6 +4475,15 @@ class App:
         def on_provider_change(*_a):
             provider = provider_var.get()
             update_preview()
+            # The Custom preset row is shown only for the Custom
+            # provider — in every other state it is hidden (not just
+            # disabled). Re-packed before the hint label so it keeps
+            # its original position when it comes back.
+            if provider == "custom":
+                preset_row.pack(fill=tk.X, padx=10, pady=(6, 0),
+                                before=hint_label)
+            else:
+                preset_row.pack_forget()
             preset_combo.configure(
                 state="readonly" if provider == "custom" else "disabled")
             if provider == "opencode":
