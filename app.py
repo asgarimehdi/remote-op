@@ -967,6 +967,10 @@ jobs:
           # <prefix>2 -> line 2, ...). A shorter list wraps around
           # instead of erroring (with 2 lines: instance 3 -> line 1,
           # instance 4 -> line 2).
+          # 2026-11-12: the built-in list is a single line,
+          # deepseek-v4.1-flash-free (Mehdi: only DeepSeek
+          # everywhere) — every instance takes line 1; the
+          # file/variable above still override it.
           _models = []
           try:
               with open(os.path.join(os.environ.get("GITHUB_WORKSPACE", "."), "opencode/default-models.txt")) as _mf:
@@ -976,12 +980,7 @@ jobs:
           if not _models:
               _models = [ln.strip() for ln in os.environ.get("OPENCODE_MODELS", "").splitlines() if ln.strip()]
           if not _models:
-              _models = [
-                  "opencode/deepseek-v4.1-flash-free",
-                  "opencode/glm-5.3-flash-free",
-                  "opencode/mimo-v2.6-flash-free",
-                  "opencode/beam-free",
-              ]
+              _models = ["opencode/deepseek-v4.1-flash-free"]
           # The instance number is the trailing digits of WF_NAME,
           # whatever the prefix is (open3, mehdi3, fork12, ...): the
           # model list is indexed by that number.
@@ -1128,8 +1127,8 @@ jobs:
 
           # 4c. oh-my-opencode-slim: write/merge its config
           #     (~/.config/opencode/oh-my-opencode-slim.json) with a "free" preset
-          #     that puts EVERY agent on a free OpenCode Zen model, plus
-          #     free councillors for the Council agent. The merge
+          #     that puts EVERY agent on deepseek-v4.1-flash-free, plus
+          #     deepseek councillors for the Council agent. The merge
           #     preserves any other presets/settings already present, and
           #     "preset" is only defaulted to "free" when unset, so a
           #     preset later picked with /preset is not forced back.
@@ -1144,6 +1143,10 @@ jobs:
           #     2026-10-17: beam-free is Reflection Beam, the
           #     de-stealthed successor of cat-jam-free (deprecated,
           #     gone from the live Zen list); same interface.
+          #     2026-11-12: every seat and every councillor is
+          #     deepseek-v4.1-flash-free (Mehdi: only DeepSeek
+          #     everywhere) — the per-role models are kept in git
+          #     history, not here.
           python3 - <<'PYEOF3'
           import json, os
           path = os.path.expanduser("~/.config/opencode/oh-my-opencode-slim.json")
@@ -1155,12 +1158,12 @@ jobs:
                   cfg = {}
           free_models = {
               "orchestrator": "opencode/deepseek-v4.1-flash-free",
-              "oracle": "opencode/nemotron-3.5-lightning-free",
-              "explorer": "opencode/glm-5.3-flash-free",
+              "oracle": "opencode/deepseek-v4.1-flash-free",
+              "explorer": "opencode/deepseek-v4.1-flash-free",
               "fixer": "opencode/deepseek-v4.1-flash-free",
-              "librarian": "opencode/glm-5.3-flash-free",
-              "designer": "opencode/beam-free",
-              "council": "opencode/nemotron-3.5-lightning-free",
+              "librarian": "opencode/deepseek-v4.1-flash-free",
+              "designer": "opencode/deepseek-v4.1-flash-free",
+              "council": "opencode/deepseek-v4.1-flash-free",
           }
           free_preset = cfg.setdefault("presets", {}).setdefault("free", {})
           for agent, model in free_models.items():
@@ -1172,8 +1175,8 @@ jobs:
           for stale in ("mimo", "spark"):
               councillors.pop(stale, None)
           for cname, cmodel in (("deepseek", "opencode/deepseek-v4.1-flash-free"),
-                                ("nemotron", "opencode/nemotron-3.5-lightning-free"),
-                                ("glm", "opencode/glm-5.3-flash-free")):
+                                ("nemotron", "opencode/deepseek-v4.1-flash-free"),
+                                ("glm", "opencode/deepseek-v4.1-flash-free")):
               councillors.setdefault(cname, {})["model"] = cmodel
           # Provider override (same CUSTOM_MODEL / NVIDIA_MODEL /
           # OPENROUTER_MODEL / NINE_ROUTER as §4, Custom checked
@@ -2899,7 +2902,7 @@ THEMES = {
         "card_border": "#e5e7eb", "heading": "#eef2f7",
         "selected": "#dbeafe", "selected_fg": "#111827",
         "tag_low": "#c0392b", "tag_ok": "#1e8449",
-        "tag_starting": "#d97706", "tag_down": "#c0392b",
+        "tag_starting": "#d97706", "tag_down": "#6b7280",
         "acct": "#e8eef5", "even": "#ffffff", "odd": "#f8fafc",
         "log_err": "#b91c1c", "log_ok": "#15803d", "log_warn": "#b45309",
         "op_running_fg": "#92400e", "op_running_bg": "#fef3c7",
@@ -2918,7 +2921,7 @@ THEMES = {
         "card_border": "#374151", "heading": "#273244",
         "selected": "#1d4ed8", "selected_fg": "#ffffff",
         "tag_low": "#f87171", "tag_ok": "#4ade80",
-        "tag_starting": "#fbbf24", "tag_down": "#f87171",
+        "tag_starting": "#fbbf24", "tag_down": "#9ca3af",
         "acct": "#1e293b", "even": "#111827", "odd": "#1a2233",
         "log_err": "#f87171", "log_ok": "#4ade80", "log_warn": "#fbbf24",
         "op_running_fg": "#fbbf24", "op_running_bg": "#3a2f10",
@@ -3097,7 +3100,12 @@ class App:
         tk.Label(util, textvariable=self.uptime_var, bg=BG,
                  fg=MUTED).pack(side=tk.LEFT, padx=6)
 
-        section(right, "LOG")
+        log_head = tk.Frame(right, bg=BG)
+        log_head.pack(fill=tk.X, padx=12, pady=(12, 4))
+        tk.Label(log_head, text="LOG", bg=BG, fg=MUTED,
+                 font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
+        ttk.Button(log_head, text="Clear log",
+                   command=lambda: self.logbox.delete("1.0", tk.END)).pack(side=tk.RIGHT)
         self.op_var = tk.StringVar(value="")
         self.op_label = tk.Label(right, textvariable=self.op_var, anchor="w",
                                  bg=pal["heading"], fg=INK,
@@ -3372,6 +3380,15 @@ class App:
                         font=("Segoe UI", 10, "bold"), relief="flat")
         style.map("Treeview", background=[("selected", pal["selected"])],
                   foreground=[("selected", pal["selected_fg"])])
+        # Without these, hovering a radio button or checkbutton in
+        # the dark theme turns its background white while the text
+        # is already near-white — unreadable. The hover stays dark.
+        style.map("TRadiobutton",
+                  background=[("active", pal["button_active"])],
+                  foreground=[("active", pal["ink"])])
+        style.map("TCheckbutton",
+                  background=[("active", pal["button_active"])],
+                  foreground=[("active", pal["ink"])])
         style.configure("TCombobox", padding=4, fieldbackground=pal["panel"],
                         foreground=pal["ink"], background=pal["button"])
         style.configure("TEntry", fieldbackground=pal["panel"],
@@ -3597,8 +3614,9 @@ class App:
                         tag = "starting"
                 srv = self._server_text(label, wf)
                 # One row colour only (ttk tags are per-row): a DOWN
-                # server outranks the green/orange tints, but never
-                # the red low-budget warning.
+                # server (grey — off, not urgent) outranks the
+                # green/orange tints, but never the red low-budget
+                # warning.
                 row_tag = tag
                 if srv_state == "down" and row_tag != "low":
                     row_tag = "down"
@@ -3822,9 +3840,10 @@ class App:
                          f"presets…' or run as-is; NOT dispatched")
             elif is_opencode:
                 self.log(f"{cfg['label']}/{wf}: no OpenCode account "
-                         f"configured — add accounts in 'OpenCode "
-                         f"accounts…' or pick another provider; "
-                         f"NOT dispatched")
+                         f"configured — add just the account NAMES in "
+                         f"'OpenCode accounts…' (no token needed — the "
+                         f"runner reads it from the GitHub secret) or "
+                         f"pick another provider; NOT dispatched")
             else:
                 provider = "NVIDIA" if is_nvidia else "OpenRouter"
                 self.log(f"{cfg['label']}/{wf}: no {provider} account "
@@ -4540,8 +4559,10 @@ class App:
                     preview_var.set("This run (Zen, per-instance model): "
                                     + preview)
                 elif not oc_names:
-                    preview_var.set("No OpenCode accounts yet — add them "
-                                    "in 'OpenCode accounts…' (top bar), or "
+                    preview_var.set("No OpenCode accounts yet — add just "
+                                    "their NAMES in 'OpenCode accounts…' "
+                                    "(top bar; no token needed — the runner "
+                                    "reads it from the GitHub secret), or "
                                     "pick another provider.")
                 else:
                     preview_var.set("Zen: each machine keeps its "
@@ -5170,26 +5191,32 @@ class App:
         form.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=6, pady=6)
         vars_ = {}
         rows = [("name", "Name", 30, False),
-                ("token", "Token", 46, True)]
+                ("token", "Token (optional)", 46, True)]
         for key, title, w, secret in rows:
             r = tk.Frame(form)
             r.pack(fill=tk.X, pady=2)
-            tk.Label(r, text=title, width=12, anchor="w").pack(side=tk.LEFT)
+            tk.Label(r, text=title, width=18, anchor="w").pack(side=tk.LEFT)
             v = tk.StringVar()
             tk.Entry(r, textvariable=v, width=w,
                      show="•" if secret else "").pack(side=tk.LEFT)
             vars_[key] = v
-        tk.Label(form, text="Tokens live in settings.json next to the exe "
-                            "(like PATs — keep the file private) and are "
-                            "never sent at dispatch. The runner reads the "
-                            "token from the OPENCODE_KEYS GitHub Secret "
-                            "(JSON: name -> token), which you set yourself "
-                            "in each fleet repo. 'Copy JSON' builds that "
-                            "secret's content from the accounts here. "
+        tk.Label(form, text="Only the NAME is needed to run: Remote-Op "
+                            "sends just the name at dispatch and the "
+                            "runner reads the token from the OPENCODE_KEYS "
+                            "GitHub Secret (JSON: name -> token), which you "
+                            "set yourself in each fleet repo. So on a new "
+                            "computer, add the names here and leave the "
+                            "token empty \u2014 the secret is already on GitHub. "
+                            "A token is only needed here if you want 'Copy "
+                            "JSON' to rebuild that secret's content "
+                            "(it includes only accounts that have one). "
+                            "Tokens live in settings.json next to the exe "
+                            "(like PATs \u2014 keep the file private) and are "
+                            "never sent at dispatch or logged. "
                             "ORDER MATTERS: machine 1 uses the 1st account "
                             "in this list, machine 2 the 2nd, and so on "
                             "(wrapping when there are more machines than "
-                            "accounts) — reorder with Move up / Move down, "
+                            "accounts) \u2014 reorder with Move up / Move down, "
                             "without retyping a token. The model is NOT "
                             "picked here: a plain Run keeps each machine's "
                             "per-instance Zen model and only the key comes "

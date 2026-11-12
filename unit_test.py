@@ -1,4 +1,4 @@
-import sys, types, os, json, tempfile
+import sys, types, os, json, re, tempfile
 # stub tkinter so app.py imports headless
 for name in ("tkinter", "tkinter.ttk", "tkinter.messagebox",
              "tkinter.scrolledtext", "tkinter.simpledialog"):
@@ -180,7 +180,30 @@ for _name, _pal in app.THEMES.items():
 assert app.THEMES["light"]["bg"] != app.THEMES["dark"]["bg"]
 assert app._norm_hex("#666") == "#666666"
 assert app._norm_hex("#ABCDEF") == "#abcdef"
+# low budget (<2h) and down must read apart: low stays red (urgent),
+# down is grey (off, not urgent) — in both themes.
+for _name, _pal in app.THEMES.items():
+    assert _pal["tag_low"] != _pal["tag_down"], _name
+    assert _pal["tag_down"] == _pal["muted"], _name
 print("theme palettes OK")
+
+# --- OpenCode accounts: name-only is enough to dispatch --------------------
+_oc = app.normalize_opencode_accounts(
+    [{"name": " a1 ", "token": ""}, {"name": "a2", "token": "tok"},
+     {"name": "", "token": "x"}, {"name": "a1", "token": "dup"}])
+assert _oc == [{"name": "a1", "token": ""},
+               {"name": "a2", "token": "tok"}]
+# Copy JSON rebuilds the secret from tokens only — a name-only
+# account is left out (its token already lives in the secret).
+assert json.loads(app.opencode_keys_json(_oc)) == {"a2": "tok"}
+# ...but dispatch still resolves it: only the NAME is ever sent.
+assert app.opencode_dispatch_inputs_for_machine(
+    ("opencode",), "syd1", _oc) == {"opencode_account": "a1"}
+assert app.opencode_dispatch_inputs_for_machine(
+    ("opencode",), "syd2", _oc) == {"opencode_account": "a2"}
+assert app.opencode_dispatch_inputs_for_machine(
+    ("opencode",), "syd1", []) == {}
+print("opencode name-only accounts OK")
 
 
 # --- fake GitHub ------------------------------------------------------------
@@ -1257,6 +1280,31 @@ assert 'os.environ.get("NINE_ROUTER_API_KEY"' in _t  # key still feeds the block
 assert "opencode/deepseek-v4.1-flash-free" in _t  # Zen default intact
 assert "default-models.txt" in _t and "OPENCODE_DEFAULT_MODELS" in _t
 print("opencode template (inputs + 12e + §4/§4c flag + step 13 guard) OK")
+
+# --- DeepSeek-only default (2026-11-12) ----------------------------------------
+# Main model: the §4 built-in fallback is a single DeepSeek line, so
+# every instance takes line 1 (the modulo wrap makes _idx irrelevant).
+# Slim seats: §4c puts every agent AND every councillor on DeepSeek.
+# (The 2026-10-16/17 history comments still name glm/beam — those are
+# comments, not code, so the assertions below scope to code lines.)
+_assigns = re.findall(r'_models = \[[^\]]*\]', _t)
+assert any(a == '_models = ["opencode/deepseek-v4.1-flash-free"]'
+           for a in _assigns), _assigns
+assert not any("glm-5.3" in a or "mimo-v2.6" in a or "beam-free" in a
+               for a in _assigns), _assigns
+_free = re.search(r'free_models = \{(.*?)\n          \}', _t, re.S)
+assert _free, "free_models dict not found in template"
+_seats = re.findall(r'"(\w+)": "(opencode/[^"]+)"', _free.group(1))
+assert {s for s, _m in _seats} == {
+    "orchestrator", "oracle", "explorer", "fixer", "librarian",
+    "designer", "council"}, _seats
+assert all(m == "opencode/deepseek-v4.1-flash-free" for _s, m in _seats), _seats
+_council = re.search(r'for cname, cmodel in \((.*?)\)\s*:', _t, re.S)
+assert _council, "councillors tuple not found in template"
+assert "opencode/nemotron" not in _council.group(1)
+assert "opencode/glm" not in _council.group(1)
+assert _council.group(1).count("opencode/deepseek-v4.1-flash-free") == 3
+print("deepseek-only default (§4 single line + §4c all seats) OK")
 
 # --- 9router keys repo ----------------------------------------------------------
 # step 12 fetches the shared db from the account's private keys repo

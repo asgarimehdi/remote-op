@@ -153,10 +153,21 @@ and the same light theme.
   statuses every cycle (30s while anything is starting, else
   5 minutes), so a stopped machine flips to ● DOWN by itself
   instead of sitting on ◐ STARTING until the next manual Refresh.
+  Row colours: green = up, orange = starting, red = less than
+  2 hours of run budget left, grey = down (off, not urgent).
 - **Dark theme** — a "Dark theme" checkbox next to Hide down
   switches the whole app (main window and open dialogs) between
   the dark palette (the default) and the original light one, live
   and without a restart; the choice is saved in `settings.json`.
+  Radio buttons and checkbuttons keep a dark hover in both
+  themes (no white-on-white text).
+- **Clear log** — a "Clear log" button next to the LOG heading
+  empties the log pane when it gets crowded.
+- **OpenCode accounts need only names** — on a new computer, add
+  the account names in "OpenCode accounts…" and leave the token
+  empty: dispatch sends just the name and the runner reads the
+  token from the `OPENCODE_KEYS` GitHub Secret. A token is only
+  needed here if "Copy JSON" should rebuild that secret.
 
 New instances start with a clean state and create
 `opencode/instances/<name>/` on their first sync.
