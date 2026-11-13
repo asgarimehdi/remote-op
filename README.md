@@ -49,9 +49,11 @@ and the same light theme.
   account's token, or type a model ID), a model from the live
   catalog of the picked Custom preset's base URL (fetched with
   that preset's token, or type a model ID — the preset's model
-  is the default when nothing is picked or typed), OpenCode
-  (the default, pre-selected: each machine's per-instance Zen
-  model with its OpenCode account's key — no model to pick), or
+  is the default when nothing is picked or typed), Raw
+  (the default, pre-selected: no account, no key — each
+  machine's per-instance model, DeepSeek default — no model
+  to pick), OpenCode (each machine's per-instance Zen model
+  with its OpenCode account's key — no model to pick), or
   9router (fixed `9router/code` for every machine — no account
   or model to pick) — or cancel — and shows which account each
   machine will use (or which Custom preset the run uses). The
@@ -73,9 +75,10 @@ and the same light theme.
   runs `custom/<model>`; for 9router it writes a `9router`
   provider block and runs `9router/code`); a plain dispatch
   keeps the per-instance Zen model with the machine's OpenCode
-  account. With no OpenCode account configured, a plain dispatch
-  dispatches nothing (a clear log line instead of a silent
-  fallback). Tokens are never sent in a dispatch, never logged,
+  account; a plain (Raw) dispatch boots the per-instance model
+  with no account and no key. With no OpenCode account
+  configured, an OpenCode dispatch dispatches nothing (a clear
+  log line instead of a silent fallback). Tokens are never sent in a dispatch, never logged,
   and never committed.
 - **Add instance… / Create N from first…** — create one instance, or
   give a number (e.g. **10**) and create that many at once, cloned

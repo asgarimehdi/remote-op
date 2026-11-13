@@ -1217,6 +1217,7 @@ assert app.opencode_dispatch_inputs_for_machine(
 assert app.opencode_dispatch_inputs_for_machine(
     ("openrouter", "m"), "syd1", _oc_accts) == {}
 assert app.nine_router_dispatch_inputs() == {"nine_router": "true"}
+assert app.raw_dispatch_inputs() == {}  # Raw = no inputs at all
 print("opencode normalize/lookup/inputs + per-machine mapping OK")
 
 # reorder helper mirrors the account ones (whole-entry swap, ends no-op)
@@ -1252,6 +1253,14 @@ try:
     _CapGH.seen = "NOT-CALLED"
     _app._dispatch(CFG, "syd1", ("9router",))
     assert _CapGH.seen == {"nine_router": "true"}, _CapGH.seen
+    # Raw dispatches with NO inputs — even with no accounts at all —
+    # and the log names it Raw (never a silent fallback, never a skip).
+    _app.settings["opencode_accounts"] = []
+    _CapGH.seen = "NOT-CALLED"
+    _app._dispatch(CFG, "syd1", ("raw",))
+    assert _CapGH.seen == {}, _CapGH.seen
+    assert any("(Raw: no account" in l for l in logs), logs
+    _app.settings["opencode_accounts"] = _oc_accts
     # the old providers still route: OpenRouter per-machine, plain as-is
     _app.settings["openrouter_accounts"] = [
         {"name": "o1", "token": "t1"}, {"name": "o2", "token": "t2"}]
@@ -1262,10 +1271,11 @@ try:
     assert _CapGH.seen == {}, _CapGH.seen
 finally:
     app.GH = _orig_GH
-print("opencode/9router dispatch routing (per-machine + no-account skip) OK")
+print("opencode/9router/raw dispatch routing (per-machine + no-account skip + raw empty) OK")
 
 # template: opencode_account + nine_router inputs, step 12e fail-fast
-# lookup, §4 9router-on-flag-only + Zen default, §4c seats, step 13 guard
+# lookup, §4 9router-on-flag-only + Zen default, §4c seats, step 13 Raw
+# note (empty means Raw — no fail-fast on an empty dispatch)
 _t = app.embedded_template("syd1", "haileen5/my-opencode")
 assert "opencode_account:" in _t and "nine_router:" in _t
 assert "12e. Resolve OpenCode account for this run" in _t
@@ -1273,7 +1283,10 @@ assert "OPENCODE_KEYS" in _t and "OPENCODE_API_KEY" in _t
 assert 'if: inputs.opencode_account != ' in _t
 assert 'os.environ.get("NINE_ROUTER"' in _t
 assert 'NINE_ROUTER: ${{ inputs.nine_router }}' in _t
-assert "no provider selected" in _t
+assert "no provider selected" not in _t  # Raw: empty is a valid dispatch
+assert "Raw dispatch: no provider inputs" in _t
+assert "empty = Raw (no account, DeepSeek default)" in _t
+assert "empty = Raw (no account)" in _t
 assert "elif _nr_flag:" in _t
 assert '_nr_flag = os.environ.get("NINE_ROUTER"' in _t
 assert 'os.environ.get("NINE_ROUTER_API_KEY"' in _t  # key still feeds the block
